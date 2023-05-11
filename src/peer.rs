@@ -7,6 +7,7 @@ use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::sync::{Arc, Weak};
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
@@ -264,6 +265,12 @@ where
     }
 }
 
+impl<S> std::fmt::Display for ActivePeer<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ActivePeer({})", self.peer_info.id)
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub id: PeerId,
@@ -344,13 +351,13 @@ mod test {
 
     #[tokio::test]
     async fn peer_connection_lifecycle() -> Result<()> {
-        let p1 = peer("127.0.0.1:12001").await?;
+        let p1 = peer("localhost:12001").await?;
         let mut e1 = p1.events();
-        let p2 = peer("127.0.0.1:12002").await?;
+        let p2 = peer("localhost:12002").await?;
         let mut e2 = p2.events();
 
-        let a = PeerId::from("127.0.0.1:12001");
-        let b = PeerId::from("127.0.0.1:12002");
+        let a = PeerId::from("localhost:12001");
+        let b = PeerId::from("localhost:12002");
         p1.send(&b, &"hello").await?;
         p2.send(&a, &"world").await?;
 

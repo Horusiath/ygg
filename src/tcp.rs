@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{ready, Sink, SinkExt, Stream, StreamExt};
 use std::fmt::Formatter;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ pub struct Tcp {
 
 impl Tcp {
     pub async fn bind(addr: &str, info: Arc<PeerInfo>) -> Result<Self> {
-        let server = TcpListener::bind(SocketAddr::from_str(addr)?).await?;
+        let server = TcpListener::bind(addr).await?;
         let public_endpoint = server.local_addr()?.to_string();
         let peer_info = Bytes::from(serde_cbor::to_vec(&info)?);
         Ok(Tcp {
@@ -92,7 +92,7 @@ impl Connector for Tcp {
     }
 
     async fn connect(&self, remote_endpoint: &str) -> Result<(Arc<PeerInfo>, TcpSink, TcpSource)> {
-        let stream = TcpStream::connect(SocketAddr::from_str(remote_endpoint)?).await?;
+        let stream = TcpStream::connect(remote_endpoint).await?;
         let (source, sink) = stream.into_split();
         let mut sink = TcpSink::new(sink);
         let mut source = TcpSource::new(source);
