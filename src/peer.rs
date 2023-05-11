@@ -1,4 +1,3 @@
-use crate::tcp::{Tcp, TcpSink, TcpSource};
 use crate::{Error, Result};
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -25,8 +24,11 @@ where
     events: Sender<Event>,
 }
 
-impl Peer<Tcp> {
-    pub fn new(connector: Tcp, options: Options) -> Self {
+impl<C> Peer<C>
+where
+    C: Connector + 'static,
+{
+    pub fn new(connector: C, options: Options) -> Self {
         let connector = Arc::new(connector);
         let connections = Arc::new(RwLock::new(HashMap::new()));
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
@@ -189,10 +191,10 @@ impl Peer<Tcp> {
     }
 
     async fn handle_conn(
-        mut source: TcpSource,
+        mut source: C::Source,
         peer_id: PeerId,
         mailbox: Sender<Event>,
-        connections: Weak<RwLock<HashMap<Arc<str>, Arc<ActivePeer<TcpSink>>>>>,
+        connections: Weak<RwLock<HashMap<Arc<str>, Arc<ActivePeer<C::Sink>>>>>,
     ) {
         while let Some(msg) = source.next().await {
             match msg {
@@ -321,9 +323,9 @@ pub enum EventData {
 }
 
 #[async_trait::async_trait]
-pub trait Connector {
-    type Sink: Sink<Bytes> + Send + Sync;
-    type Source: Stream<Item = Result<Bytes>> + Send + Sync;
+pub trait Connector: Send + Sync {
+    type Sink: Sink<Bytes, Error = Error> + Send + Sync + Unpin;
+    type Source: Stream<Item = Result<Bytes>> + Send + Sync + Unpin;
 
     async fn accept(&self) -> Result<(Arc<PeerInfo>, Self::Sink, Self::Source)>;
     async fn connect(
