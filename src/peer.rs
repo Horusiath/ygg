@@ -19,7 +19,7 @@ where
     C: Connector,
 {
     connector: Arc<C>,
-    connections: Arc<RwLock<HashMap<PeerId, Arc<Mutex<ActivePeer<C::Sink>>>>>>,
+    connections: Arc<RwLock<HashMap<PeerId, Arc<ActivePeer<C::Sink>>>>>,
     options: Options,
     events: Sender<Event>,
 }
@@ -39,8 +39,7 @@ impl Peer<Tcp> {
                     match server.accept().await {
                         Ok((peer_info, sink, source)) => {
                             if let Some(connections) = connections.upgrade() {
-                                let peer =
-                                    Arc::new(Mutex::new(ActivePeer::new(peer_info.clone(), sink)));
+                                let peer = ActivePeer::new(peer_info.clone(), sink);
                                 {
                                     let peer_id = peer_info.id.clone();
                                     let mut connections = connections.write().await;
@@ -51,7 +50,6 @@ impl Peer<Tcp> {
                                             );
                                             let old = e.insert(peer.clone());
                                             {
-                                                let mut old = old.lock().await;
                                                 if let Err(e) = old.close().await {
                                                     log::warn!(
                                                     "failed to gracefully close '{peer_id}': {e}"
@@ -116,12 +114,11 @@ impl Peer<Tcp> {
                 let connections = self.connections.read().await;
                 if let Some(conn) = connections.get(recipient) {
                     let data = Bytes::from(serde_cbor::to_vec(msg)?);
-                    let mut conn = conn.lock().await;
                     conn.send(data).await.map(|_| None)
                 } else {
                     log::info!("establishing new connection to '{recipient}'");
                     let (peer_info, sink, source) = self.connector.connect(recipient).await?;
-                    let peer = Arc::new(Mutex::new(ActivePeer::new(peer_info, sink)));
+                    let peer = ActivePeer::new(peer_info, sink);
                     Ok(Some((peer, source)))
                 }
             };
@@ -138,7 +135,6 @@ impl Peer<Tcp> {
                                 log::info!("replacing existing peer connection '{recipient}'");
                                 let old = e.insert(peer.clone());
                                 {
-                                    let mut old = old.lock().await;
                                     if let Err(e) = old.close().await {
                                         log::warn!("failed to gracefully close '{recipient}': {e}");
                                     }
@@ -166,7 +162,6 @@ impl Peer<Tcp> {
                         connections.remove(recipient)
                     };
                     if let Some(c) = conn {
-                        let mut c = c.lock().await;
                         if let Err(e) = c.close().await {
                             log::warn!(
                                 "failed to gracefully close connection to '{recipient}': {e}"
@@ -182,7 +177,6 @@ impl Peer<Tcp> {
     pub(crate) async fn disconnect(&self, peer: &PeerId) -> Result<()> {
         let mut conns = self.connections.write().await;
         if let Some(conn) = conns.remove(peer) {
-            let mut conn = conn.lock().await;
             if let Err(e) = conn.close().await {
                 log::warn!("failed to gracefully close connection to '{peer}': {e}");
             } else {
@@ -197,7 +191,7 @@ impl Peer<Tcp> {
         mut source: TcpSource,
         peer_id: PeerId,
         mailbox: Sender<Event>,
-        connections: Weak<RwLock<HashMap<Arc<str>, Arc<Mutex<ActivePeer<TcpSink>>>>>>,
+        connections: Weak<RwLock<HashMap<Arc<str>, Arc<ActivePeer<TcpSink>>>>>,
     ) {
         while let Some(msg) = source.next().await {
             match msg {
@@ -210,7 +204,6 @@ impl Peer<Tcp> {
                         let mut connections = connections.write().await;
                         if let Some(c) = connections.remove(&peer_id) {
                             drop(connections);
-                            let mut c = c.lock().await;
                             if let Err(e) = c.close().await {
                                 log::warn!("failed to close connection to '{peer_id}': {e}");
                             }
@@ -243,26 +236,31 @@ impl Default for Options {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct ActivePeer<S> {
     peer_info: Arc<PeerInfo>,
-    sender: S,
+    sender: Mutex<S>,
 }
 
 impl<S> ActivePeer<S>
 where
     S: Sink<Bytes, Error = Error> + Unpin,
 {
-    fn new(peer_info: Arc<PeerInfo>, sender: S) -> Self {
-        ActivePeer { sender, peer_info }
+    fn new(peer_info: Arc<PeerInfo>, sender: S) -> Arc<Self> {
+        Arc::new(ActivePeer {
+            sender: Mutex::new(sender),
+            peer_info,
+        })
     }
 
-    pub async fn send(&mut self, bytes: Bytes) -> Result<()> {
-        self.sender.send(bytes).await
+    pub async fn send(&self, bytes: Bytes) -> Result<()> {
+        let mut s = self.sender.lock().await;
+        s.send(bytes).await
     }
 
-    pub(crate) async fn close(&mut self) -> Result<()> {
-        self.sender.close().await
+    pub(crate) async fn close(&self) -> Result<()> {
+        let mut s = self.sender.lock().await;
+        s.close().await
     }
 }
 
@@ -378,13 +376,13 @@ mod test {
             .filter_level(LevelFilter::Info)
             .is_test(true)
             .try_init();
-        let p1 = peer("127.0.0.1:12001").await?;
+        let p1 = peer("127.0.0.1:12003").await?;
         let mut e1 = p1.events();
-        let p2 = peer("127.0.0.1:12002").await?;
+        let p2 = peer("127.0.0.1:12004").await?;
         let mut e2 = p2.events();
 
-        let a = PeerId::from("127.0.0.1:12001");
-        let b = PeerId::from("127.0.0.1:12002");
+        let a = PeerId::from("127.0.0.1:12003");
+        let b = PeerId::from("127.0.0.1:12004");
         p1.send(&b, &"hello").await?;
         p2.send(&a, &"world").await?;
 
