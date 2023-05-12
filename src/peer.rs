@@ -52,34 +52,33 @@ where
                                                 "replacing existing peer connection '{peer_id}'"
                                             );
                                             let old = e.insert(peer.clone());
-                                            {
-                                                if let Err(e) = old.close().await {
-                                                    log::warn!(
+
+                                            let graceful = if let Err(e) = old.close().await {
+                                                log::warn!(
                                                     "failed to gracefully close '{peer_id}': {e}"
                                                 );
-                                                }
-                                            }
-                                            let _ = mailbox.send(Event::down(peer_id.clone()));
-                                            let _ = mailbox.send(Event::up(peer_id.clone()));
+                                                false
+                                            } else {
+                                                true
+                                            };
+
+                                            let _ = mailbox
+                                                .send(Event::down(graceful, peer_info.clone()));
+                                            let _ = mailbox.send(Event::up(peer_info.clone()));
                                         }
                                         Entry::Vacant(e) => {
                                             e.insert(peer.clone());
-                                            let _ = mailbox.send(Event::up(peer_id.clone()));
+                                            let _ = mailbox.send(Event::up(peer_info.clone()));
                                         }
                                     }
                                 }
 
-                                let receiver_loop = {
-                                    let mailbox = mailbox.clone();
-                                    let id = peer_info.id.clone();
-                                    let connections = Arc::downgrade(&connections);
-                                    tokio::spawn(Self::handle_conn(
-                                        source,
-                                        id,
-                                        mailbox,
-                                        connections,
-                                    ))
-                                };
+                                let receiver_loop = tokio::spawn(Self::handle_conn(
+                                    source,
+                                    peer_info.clone(),
+                                    mailbox.clone(),
+                                    Arc::downgrade(&connections),
+                                ));
                             } else {
                                 break;
                             }
@@ -131,28 +130,32 @@ where
                     return Ok(());
                 }
                 Ok(Some((peer, source))) => {
+                    let peer_info = peer.peer_info.clone();
                     {
                         let mut connections = self.connections.write().await;
                         match connections.entry(recipient.clone()) {
                             Entry::Occupied(mut e) => {
                                 log::info!("replacing existing peer connection '{recipient}'");
                                 let old = e.insert(peer.clone());
-                                {
-                                    if let Err(e) = old.close().await {
-                                        log::warn!("failed to gracefully close '{recipient}': {e}");
-                                    }
-                                }
-                                let _ = self.events.send(Event::down(recipient.clone()));
+                                let graceful = if let Err(e) = old.close().await {
+                                    log::warn!("failed to gracefully close '{recipient}': {e}");
+                                    false
+                                } else {
+                                    true
+                                };
+                                let _ = self
+                                    .events
+                                    .send(Event::down(graceful, old.peer_info.clone()));
                             }
                             Entry::Vacant(e) => {
                                 e.insert(peer.clone());
                             }
                         }
                     }
-                    let _ = self.events.send(Event::up(recipient.clone()));
+                    let _ = self.events.send(Event::up(peer_info.clone()));
                     let receiver_loop = tokio::spawn(Self::handle_conn(
                         source,
-                        recipient.clone(),
+                        peer_info,
                         self.events.clone(),
                         Arc::downgrade(&self.connections),
                     ));
@@ -180,32 +183,38 @@ where
     pub(crate) async fn disconnect(&self, peer: &PeerId) -> Result<()> {
         let mut conns = self.connections.write().await;
         if let Some(conn) = conns.remove(peer) {
-            if let Err(e) = conn.close().await {
+            let peer_info = conn.peer_info.clone();
+            let graceful = if let Err(e) = conn.close().await {
                 log::warn!("failed to gracefully close connection to '{peer}': {e}");
+                false
             } else {
                 log::info!("disconnected from '{peer}'");
-            }
-            let _ = self.events.send(Event::down(peer.clone()));
+                true
+            };
+            let _ = self.events.send(Event::down(graceful, peer_info));
         }
         Ok(())
     }
 
     async fn handle_conn(
         mut source: C::Source,
-        peer_id: PeerId,
+        peer_info: Arc<PeerInfo>,
         mailbox: Sender<Event>,
         connections: Weak<RwLock<HashMap<Arc<str>, Arc<ActivePeer<C::Sink>>>>>,
     ) {
+        let mut graceful = true;
         while let Some(msg) = source.next().await {
             match msg {
                 Ok(msg) => {
-                    let _ = mailbox.send(Event::message(msg, peer_id.clone()));
+                    let _ = mailbox.send(Event::message(msg, peer_info.clone()));
                 }
                 Err(e) => {
+                    graceful = false;
+                    let peer_id = &peer_info.id;
                     log::warn!("failed to receive message from '{peer_id}': {e}");
                     if let Some(connections) = connections.upgrade() {
                         let mut connections = connections.write().await;
-                        if let Some(c) = connections.remove(&peer_id) {
+                        if let Some(c) = connections.remove(peer_id) {
                             drop(connections);
                             if let Err(e) = c.close().await {
                                 log::warn!("failed to close connection to '{peer_id}': {e}");
@@ -216,7 +225,7 @@ where
                 }
             }
         }
-        let _ = mailbox.send(Event::down(peer_id));
+        let _ = mailbox.send(Event::down(graceful, peer_info));
     }
 }
 
@@ -290,24 +299,24 @@ impl PeerInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
-    sender: PeerId,
+    sender: Arc<PeerInfo>,
     event: EventData,
 }
 
 impl Event {
-    pub(crate) fn up(sender: PeerId) -> Self {
+    pub(crate) fn up(sender: Arc<PeerInfo>) -> Self {
         Event {
             sender,
             event: EventData::Up,
         }
     }
-    pub(crate) fn down(sender: PeerId) -> Self {
+    pub(crate) fn down(graceful: bool, sender: Arc<PeerInfo>) -> Self {
         Event {
             sender,
-            event: EventData::Down,
+            event: EventData::Down(graceful),
         }
     }
-    pub(crate) fn message(msg: Bytes, sender: PeerId) -> Self {
+    pub(crate) fn message(msg: Bytes, sender: Arc<PeerInfo>) -> Self {
         Event {
             sender,
             event: EventData::Message(msg),
@@ -319,7 +328,7 @@ impl Event {
 pub enum EventData {
     Message(Bytes),
     Up,
-    Down,
+    Down(bool),
 }
 
 #[async_trait::async_trait]
@@ -336,7 +345,7 @@ pub trait Connector: Send + Sync {
 
 #[cfg(test)]
 mod test {
-    use crate::peer::{Event, Options, Peer, PeerId, PeerInfo};
+    use crate::peer::{Event, Options, Peer, PeerInfo};
     use crate::tcp::Tcp;
     use crate::Result;
     use bytes::Bytes;
@@ -358,10 +367,10 @@ mod test {
         let p2 = peer("localhost:12002").await?;
         let mut e2 = p2.events();
 
-        let a = PeerId::from("localhost:12001");
-        let b = PeerId::from("localhost:12002");
-        p1.send(&b, &"hello").await?;
-        p2.send(&a, &"world").await?;
+        let a = Arc::new(PeerInfo::new("localhost:12001".into()));
+        let b = Arc::new(PeerInfo::new("localhost:12002".into()));
+        p1.send(&b.id, &"hello").await?;
+        p2.send(&a.id, &"world").await?;
 
         let expected_msg = Bytes::from(serde_cbor::to_vec(&"world")?);
         assert_eq!(e1.recv().await, Ok(Event::up(b.clone())));
@@ -374,7 +383,7 @@ mod test {
         drop(e2);
         drop(p2);
 
-        assert_eq!(e1.recv().await, Ok(Event::down(b)));
+        assert_eq!(e1.recv().await, Ok(Event::down(true, b)));
 
         Ok(())
     }
@@ -390,10 +399,10 @@ mod test {
         let p2 = peer("127.0.0.1:12004").await?;
         let mut e2 = p2.events();
 
-        let a = PeerId::from("127.0.0.1:12003");
-        let b = PeerId::from("127.0.0.1:12004");
-        p1.send(&b, &"hello").await?;
-        p2.send(&a, &"world").await?;
+        let a = Arc::new(PeerInfo::new("127.0.0.1:12003".into()));
+        let b = Arc::new(PeerInfo::new("127.0.0.1:12004".into()));
+        p1.send(&b.id, &"hello").await?;
+        p2.send(&a.id, &"world").await?;
 
         let expected_msg = Bytes::from(serde_cbor::to_vec(&"world")?);
         assert_eq!(e1.recv().await, Ok(Event::up(b.clone())));
@@ -403,9 +412,9 @@ mod test {
         assert_eq!(e2.recv().await, Ok(Event::up(a.clone())));
         assert_eq!(e2.recv().await, Ok(Event::message(expected_msg, a.clone())));
 
-        p1.disconnect(&b).await?;
-        assert_eq!(e1.recv().await, Ok(Event::down(b.clone())));
-        assert_eq!(e2.recv().await, Ok(Event::down(a.clone())));
+        p1.disconnect(&b.id).await?;
+        assert_eq!(e1.recv().await, Ok(Event::down(true, b.clone())));
+        assert_eq!(e2.recv().await, Ok(Event::down(true, a.clone())));
 
         Ok(())
     }
