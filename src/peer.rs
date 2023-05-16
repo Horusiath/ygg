@@ -299,8 +299,8 @@ impl PeerInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
-    sender: Arc<PeerInfo>,
-    event: EventData,
+    pub sender: Arc<PeerInfo>,
+    pub event: EventData,
 }
 
 impl Event {

@@ -2,6 +2,7 @@ mod gossip;
 mod membership;
 mod peer;
 mod tcp;
+mod utils;
 mod view;
 mod webrtc;
 

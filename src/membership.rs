@@ -1,11 +1,15 @@
-use crate::peer::{Connector, Peer, PeerId, PeerInfo};
+use crate::peer::{Connector, Event, EventData, Peer, PeerId, PeerInfo};
+use crate::utils::RngExt;
 use crate::view::View;
 use crate::Result;
-use futures_util::SinkExt;
-use rand::{random, thread_rng};
+use rand::{random, thread_rng, RngCore, SeedableRng};
+use rand_chacha::{ChaCha20Rng, ChaCha8Rng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::interval;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -14,11 +18,11 @@ pub struct Options {
     /// Maximum number of passive peers (backup peers we know how to connect to, but not having
     /// an ongoing connections to).
     pub passive_view_capacity: u32,
-    pub active_random_walk_len: u32,
-    pub passive_random_walk_len: u32,
+    pub active_random_walk_len: TTL,
+    pub passive_random_walk_len: TTL,
     pub shuffle_active_view_size: u32,
     pub shuffle_passive_view_size: u32,
-    pub shuffle_random_walk_len: u32,
+    pub shuffle_random_walk_len: TTL,
     pub events_buffer_capacity: u32,
     pub shuffle_interval: Duration,
 }
@@ -44,79 +48,191 @@ where
     C: Connector,
 {
     peer: Arc<Peer<C>>,
-    options: Options,
-    active_view: View<PeerId>,
-    passive_view: View<PeerId>,
+    state: Arc<Mutex<MembershipState>>,
+    msg_handler: JoinHandle<()>,
+    shuffle: JoinHandle<()>,
 }
 
-impl<C: Connector> Membership<C> {
-    pub fn new(peer: Arc<Peer<C>>) -> Self {
-        Self::with_options(peer, Options::default())
+impl<C> Membership<C>
+where
+    C: Connector + 'static,
+{
+    pub fn new<R>(peer: Arc<Peer<C>>) -> Self
+    where
+        R: RngCore + Default,
+    {
+        Self::with_options::<R>(peer, Options::default())
     }
 
-    pub fn with_options(peer: Arc<Peer<C>>, options: Options) -> Self {
+    pub fn with_options<R>(peer: Arc<Peer<C>>, options: Options) -> Self
+    where
+        R: RngCore + Default,
+    {
         let active_view = View::new(options.active_view_capacity as usize);
         let passive_view = View::new(options.passive_view_capacity as usize);
-        Membership {
-            peer,
-            options,
+        let state = Arc::new(Mutex::new(MembershipState {
             active_view,
             passive_view,
-        }
+        }));
+        let mut rng = ChaCha20Rng::from_rng(&mut R::default()).unwrap();
+        let msg_handler = {
+            let mut events = peer.events();
+            let mut rng = rng.clone();
+            let state = Arc::downgrade(&state);
+            let options = options.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                while let Ok(e) = events.recv().await {
+                    if let Some(state) = state.upgrade() {
+                        let mut state = state.lock().await;
+                        let mut ctx = MessageExecutionContext::new(&mut state, &peer, &options);
+                        if let Err(cause) = ctx.handle(e, &mut rng).await {
+                            let id = &peer.options().myself.id;
+                            log::error!("'{}' failed to handle incoming event: {}", id, cause);
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+        let shuffle = {
+            let state = Arc::downgrade(&state);
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                let mut interval = interval(options.shuffle_interval);
+                loop {
+                    let _ = interval.tick().await;
+                    if let Some(state) = state.upgrade() {
+                        let mut state = state.lock().await;
+                        let mut ctx = MessageExecutionContext::new(&mut state, &peer, &options);
+                        if let Err(cause) = ctx.shuffle(&mut rng).await {
+                            let id = &peer.options().myself.id;
+                            log::error!("'{}' failed to send shuffle request: {}", id, cause);
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            })
+        };
+        let m = Membership {
+            peer,
+            state,
+            msg_handler,
+            shuffle,
+        };
+        m
     }
 
     pub fn myself(&self) -> &PeerInfo {
         &self.peer.options().myself
     }
+}
 
-    pub fn options(&self) -> &Options {
-        &self.options
+struct MembershipState {
+    active_view: View<Arc<PeerInfo>>,
+    passive_view: View<Arc<PeerInfo>>,
+}
+
+struct MessageExecutionContext<'a, C>
+where
+    C: Connector,
+{
+    state: &'a mut MembershipState,
+    peer: &'a Arc<Peer<C>>,
+    options: &'a Options,
+}
+
+impl<'a, C> MessageExecutionContext<'a, C>
+where
+    C: Connector + 'static,
+{
+    fn new(state: &'a mut MembershipState, peer: &'a Arc<Peer<C>>, options: &'a Options) -> Self {
+        MessageExecutionContext {
+            state,
+            peer,
+            options,
+        }
     }
 
-    async fn add_active(&mut self, mut info: PeerInfo, high_priority: bool) -> Result<bool> {
-        if info.id == self.myself().id || self.active_view().contains(&info.id) {
+    fn myself(&self) -> &PeerInfo {
+        &self.peer.options().myself
+    }
+
+    pub async fn handle<R: RngCore>(&mut self, e: Event, rng: &mut R) -> Result<()> {
+        match e.event {
+            EventData::Message(bytes) => {
+                let msg: Message = serde_cbor::from_slice(&bytes)?;
+                match msg {
+                    Message::Join => self.on_join(e.sender, rng).await,
+                    Message::FwdJoin(peer, ttl) => {
+                        let sender = e.sender.id.clone();
+                        self.on_forward_join(peer, sender, ttl, rng).await
+                    }
+                    Message::Neighbor(neighbor, high_priority) => {
+                        self.on_neighbor(neighbor, high_priority, rng).await
+                    }
+                    Message::ShuffleReq(origin, ttl, peers) => {
+                        let sender = e.sender.id.clone();
+                        self.on_shuffle_request(origin, sender, ttl, peers, rng)
+                            .await
+                    }
+                    Message::ShuffleRep(peers) => Ok(self.on_shuffle_response(&peers, rng)),
+                }
+            }
+            EventData::Up => Ok(()),
+            EventData::Down(alive) => self.on_disconnected(e.sender, alive, rng).await,
+        }
+    }
+
+    async fn add_active<R: RngCore>(
+        &mut self,
+        info: Arc<PeerInfo>,
+        high_priority: bool,
+        rng: &mut R,
+    ) -> Result<bool> {
+        if info.id == self.myself().id || self.state.active_view.contains(&info.id) {
             return Ok(false);
         }
 
-        id.send(&Message::neighbor(info.clone(), high_priority))
-            .await?;
-        self.passive_view_mut().remove(&info.id);
-        let removed =
-            self.active_view_mut()
-                .insert_replace(info.id.clone(), info, &mut thread_rng());
-        if let Some((pid, mut peer)) = removed {
-            if let Err(cause) = self.disconnect(&mut peer, true).await {
+        let msg = Message::Neighbor(info.clone(), high_priority);
+        self.peer.send(&info.id, &msg).await?;
+
+        self.state.passive_view.remove(&info.id);
+        let removed = self
+            .state
+            .active_view
+            .insert_replace(info.id.clone(), info, rng);
+        if let Some((pid, peer)) = removed {
+            if let Err(cause) = self.peer.disconnect(&pid).await {
                 log::warn!("couldn't close peer {pid}: {cause}");
             }
-            self.emit(PeerEvent::Down(peer.info)).await?;
         }
-        self.emit(PeerEvent::Up(info)).await?;
         Ok(true)
     }
 
-    async fn on_join(&mut self, peer: ActivePeer<S>) -> Result<()> {
-        let info = peer.info.clone();
-        self.add_active(peer, true).await?;
-        let ttl = self.membership_options().active_random_walk_len;
-        let fwd = Message::forward_join(info.clone(), self.myself(), ttl);
+    async fn on_join<R: RngCore>(&mut self, info: Arc<PeerInfo>, rng: &mut R) -> Result<()> {
+        self.add_active(info.clone(), true, rng).await?;
+        let ttl = self.options.active_random_walk_len;
+        let fwd = Message::FwdJoin(info.clone(), ttl);
 
-        let mut failed_peers = Vec::new();
+        let mut fails = Vec::new();
         {
-            let active_view = self.active_view_mut();
-            for peer in active_view.values_mut() {
-                if peer.info.id != info.id {
-                    if let Err(cause) = peer.send(&fwd).await {
+            for info in self.state.active_view.values_mut() {
+                if info.id != info.id {
+                    if let Err(cause) = self.peer.send(&info.id, &fwd).await {
                         log::warn!("couldn't send forward join to {}: {}", info.id, cause);
-                        failed_peers.push(peer.info.id.clone());
+                        fails.push(info.id.clone());
                     }
                 }
             }
         }
 
-        for pid in failed_peers {
-            if let Some(mut peer) = self.active_view_mut().remove(&pid) {
-                if let Err(cause) = self.disconnect(&mut peer, true).await {
-                    log::warn!("couldn't disconnect peer {}: {}", peer.info.id, cause);
+        for pid in fails {
+            if let Some(info) = self.state.active_view.remove(&pid) {
+                if let Err(cause) = self.peer.disconnect(&info.id).await {
+                    log::warn!("couldn't disconnect peer {}: {}", info.id, cause);
                 }
             }
         }
@@ -124,87 +240,95 @@ impl<C: Connector> Membership<C> {
         Ok(())
     }
 
-    async fn on_disconnected(&mut self, peer: PeerId, graceful: bool) -> Result<()> {
-        if let Some(mut peer) = self.active_view_mut().remove(&peer) {
-            let _ = peer.close().await; // it doesn't matter if we confirm close, as it may be already disconnected
-            if graceful {
-                // if shutdown was graceful, we demote peer into passive view for future use
-                let info = peer.info.id.clone();
-                self.passive_view_mut()
-                    .insert_replace(info, peer.into(), &mut thread_rng());
+    async fn on_disconnected<R: RngCore>(
+        &mut self,
+        info: Arc<PeerInfo>,
+        graceful: bool,
+        rng: &mut R,
+    ) -> Result<()> {
+        let mut promoted = if graceful {
+            // if shutdown was graceful, we demote peer into passive view for future use
+            let id = info.id.clone();
+            if let Some(promoted) = self.state.passive_view.insert_replace(id, info, rng) {
+                Some(promoted)
+            } else {
+                self.state.passive_view.remove_at(rng)
             }
+        } else {
+            self.state.passive_view.remove_at(rng)
+        };
 
-            loop {
-                // promote passive peer into active one
-                if let Some((pid, promoted)) = self.passive_view_mut().remove_at(random()) {
-                    match self.connect(promoted.into()).await {
-                        Ok(peer) => {
-                            let high_priority = self.active_view().is_empty();
-                            self.add_active(peer, high_priority);
-                            break;
-                        }
-                        Err(cause) => {
-                            log::warn!("couldn't connect to {pid}: {cause}");
-                        }
-                    }
+        // promote passive peer into active one
+        while let Some((id, peer)) = promoted.take() {
+            let high_priority = self.state.active_view.is_empty();
+            match self.add_active(peer, high_priority, rng).await {
+                Ok(true) => {
+                    break;
                 }
+                Ok(false) => {}
+                Err(cause) => log::warn!("couldn't connect to {id}: {cause}"),
             }
+            promoted = self.state.passive_view.remove_at(rng);
         }
         Ok(())
     }
 
-    async fn on_neighbor(&mut self, peer: Arc<PeerInfo>, high_priority: bool) -> Result<()> {
-        if high_priority || !self.active_view_mut().is_full() {
-            let peer = self.connect(peer).await?;
-            self.add_active(peer, high_priority).await?;
+    async fn on_neighbor<R: RngCore>(
+        &mut self,
+        peer: Arc<PeerInfo>,
+        high_priority: bool,
+        rng: &mut R,
+    ) -> Result<()> {
+        if high_priority || !self.state.active_view.is_full() {
+            self.add_active(peer, high_priority, rng).await?;
         }
         Ok(())
     }
 
-    async fn on_forward_join(
+    async fn on_forward_join<R: RngCore>(
         &mut self,
         peer: Arc<PeerInfo>,
         sender: PeerId,
         ttl: u32,
+        rng: &mut R,
     ) -> Result<()> {
-        if ttl == 0 || self.active_view().is_empty() {
-            let peer = self.connect(peer.clone()).await?;
-            self.add_active(peer, true).await?;
+        if ttl == 0 || self.state.active_view.is_empty() {
+            self.add_active(peer, true, rng).await?;
         } else {
-            let myself = self.myself();
-            if ttl == self.membership_options().passive_random_walk_len {
+            if ttl == self.options.passive_random_walk_len {
                 if !self.already_known(&peer.id) {
                     let peer = peer.clone();
-                    self.passive_view_mut().insert_replace(
-                        peer.id.clone(),
-                        peer.into(),
-                        &mut thread_rng(),
-                    );
+                    self.state
+                        .passive_view
+                        .insert_replace(peer.id.clone(), peer.into(), rng);
                 }
             }
-            if let Some(conn) = self
-                .active_view_mut()
-                .peek_value_mut(random(), |v| v.info.id != sender)
+            if let Some(info) = self
+                .state
+                .active_view
+                .peek_value_mut(random(), |v| v.id != sender)
             {
-                let msg = Message::forward_join(peer.into(), myself, ttl - 1);
-                conn.send(&msg).await?;
+                let msg = Message::FwdJoin(peer, ttl - 1);
+                self.peer.send(&info.id, &msg).await?;
             }
         }
         Ok(())
     }
 
-    async fn shuffle(&mut self) -> Result<()> {
-        let recipient = self.active_view_mut().peek_key(random()).cloned();
+    async fn shuffle<R: RngCore>(&mut self, rng: &mut R) -> Result<()> {
+        let recipient = self.state.active_view.peek_key(rng).cloned();
         if let Some(recipient) = recipient {
-            let o = self.membership_options();
-            let alen = (o.shuffle_active_view_size as usize).min(self.active_view().len() - 1);
-            let plen = (o.shuffle_passive_view_size as usize).min(self.passive_view().len() - 1);
+            let alen = (self.options.shuffle_active_view_size as usize)
+                .min(self.state.active_view.len() - 1);
+            let plen = (self.options.shuffle_passive_view_size as usize)
+                .min(self.state.passive_view.len() - 1);
             let mut nodes = Vec::with_capacity(alen + plen);
             {
                 let mut peers: Vec<_> = self
-                    .active_view()
+                    .state
+                    .active_view
                     .iter()
-                    .map(|(_, v)| v.info.clone())
+                    .map(|(_, v)| v.clone())
                     .collect();
                 if let Some(i) = peers.iter().position(|peer| peer.id == recipient) {
                     peers.remove(i);
@@ -216,420 +340,109 @@ impl<C: Connector> Membership<C> {
             }
             {
                 let mut peers: Vec<_> = self
-                    .passive_view()
+                    .state
+                    .passive_view
                     .iter()
-                    .map(|(_, v)| v.info.clone())
+                    .map(|(_, v)| v.clone())
                     .collect();
                 thread_rng().shuffle(&mut peers);
                 for pid in &peers[0..plen] {
                     nodes.push(pid.clone());
                 }
             }
-            let myself = self.myself();
-            let msg =
-                Message::shuffle_request(myself.clone(), myself, o.shuffle_random_walk_len, nodes);
-            if let Some(peer) = self.active_view_mut().get_mut(&recipient) {
-                peer.send(&msg).await?;
+            let myself = self.myself().id.clone();
+            let msg = Message::ShuffleReq(myself, self.options.shuffle_random_walk_len, nodes);
+            if let Some(info) = self.state.active_view.get_mut(&recipient) {
+                self.peer.send(&info.id, &msg).await?;
             }
         }
         Ok(())
     }
 
-    async fn on_shuffle_request(
+    async fn on_shuffle_request<R: RngCore>(
         &mut self,
         origin: PeerId,
         sender: PeerId,
         ttl: u32,
         nodes: Vec<Arc<PeerInfo>>,
+        rng: &mut R,
     ) -> Result<()> {
         if ttl == 0 {
-            let exchange_len = self.passive_view().len().min(nodes.len());
+            let exchange_len = self.state.passive_view.len().min(nodes.len());
             let mut exchange_nodes = Vec::with_capacity(exchange_len);
             for node in nodes {
                 if !self.already_known(&node.id) {
-                    if let Some((_, peer)) = self.passive_view_mut().insert_replace(
-                        node.id.clone(),
-                        node.into(),
-                        &mut thread_rng(),
-                    ) {
-                        exchange_nodes.push(peer.info);
+                    if let Some((_, info)) =
+                        self.state
+                            .passive_view
+                            .insert_replace(node.id.clone(), node.into(), rng)
+                    {
+                        exchange_nodes.push(info);
                     }
                 }
             }
             if !exchange_nodes.is_empty() {
-                if let Some(origin) = self.active_view_mut().get_mut(&origin) {
-                    origin
-                        .send(&Message::shuffle_response(exchange_nodes))
+                if let Some(origin) = self.state.active_view.get_mut(&origin) {
+                    self.peer
+                        .send(&origin.id, &Message::ShuffleRep(exchange_nodes))
                         .await?;
                 }
             }
         } else {
-            let myself = self.myself();
             let peer = self
-                .active_view_mut()
-                .peek_value_mut(random(), |v| v.info.id != origin && v.info.id != sender);
-            if let Some(peer) = peer {
-                let msg = Message::shuffle_request(origin, myself, ttl - 1, nodes);
-                peer.send(&msg).await?;
+                .state
+                .active_view
+                .peek_value_mut(random(), |v| v.id != origin && v.id != sender);
+            if let Some(info) = peer {
+                let msg = Message::ShuffleReq(origin, ttl - 1, nodes);
+                self.peer.send(&info.id, &msg).await?;
             }
         }
         Ok(())
     }
 
-    fn on_shuffle_response(&mut self, nodes: &[Arc<PeerInfo>]) {
-        let mut rng = thread_rng();
+    fn on_shuffle_response<R: RngCore>(&mut self, nodes: &[Arc<PeerInfo>], rng: &mut R) {
         for node in nodes {
             if !self.already_known(&node.id) {
-                self.passive_view_mut().insert_replace(
-                    node.id.clone(),
-                    node.clone().into(),
-                    &mut rng,
-                );
+                self.state
+                    .passive_view
+                    .insert_replace(node.id.clone(), node.clone().into(), rng);
             }
         }
     }
 
     fn already_known(&self, pid: &PeerId) -> bool {
-        self.myself_ref().eq(pid)
-            || self.active_view().contains(pid)
-            || self.passive_view().contains(pid)
+        &self.myself().id == pid
+            || self.state.active_view.contains(pid)
+            || self.state.passive_view.contains(pid)
     }
 }
+
+pub type TTL = u32;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Message {}
-
-/*
-#[async_trait]
-pub trait Protocol<S>
-where
-    S: Sink<Bytes, Error = Error> + Send + Sync + Unpin + 'static,
-{
-    fn membership_options(&self) -> &Options;
-    fn active_view(&self) -> &View<ActivePeer<S>>;
-    fn passive_view(&self) -> &View<PassivePeer>;
-    fn active_view_mut(&mut self) -> &mut View<ActivePeer<S>>;
-    fn passive_view_mut(&mut self) -> &mut View<PassivePeer>;
-    fn myself_ref(&self) -> &PeerId;
-
-    fn myself(&self) -> PeerId {
-        self.myself_ref().clone()
-    }
-
-    async fn emit(&mut self, e: PeerEvent) -> Result<()>;
-    async fn connect(&mut self, peer: Arc<PeerInfo>) -> Result<ActivePeer<S>, Error>;
-
-    async fn add_active(
-        &mut self,
-        mut peer: ActivePeer<S>,
-        high_priority: bool,
-    ) -> Result<bool, Error> {
-        let info = peer.info.clone();
-        if info.id.eq(self.myself_ref()) || self.active_view().contains(&info.id) {
-            return Ok(false);
-        }
-
-        peer.send(&Message::neighbor(info.clone(), high_priority))
-            .await?;
-        self.passive_view_mut().remove(&info.id);
-        let removed =
-            self.active_view_mut()
-                .insert_replace(info.id.clone(), peer, &mut thread_rng());
-        if let Some((pid, mut peer)) = removed {
-            if let Err(cause) = self.disconnect(&mut peer, true).await {
-                log::warn!("couldn't close peer {pid}: {cause}");
-            }
-            self.emit(PeerEvent::Down(peer.info)).await?;
-        }
-        self.emit(PeerEvent::Up(info)).await?;
-        Ok(true)
-    }
-
-    async fn on_join(&mut self, peer: ActivePeer<S>) -> Result<()> {
-        let info = peer.info.clone();
-        self.add_active(peer, true).await?;
-        let ttl = self.membership_options().active_random_walk_len;
-        let fwd = Message::forward_join(info.clone(), self.myself(), ttl);
-
-        let mut failed_peers = Vec::new();
-        {
-            let active_view = self.active_view_mut();
-            for peer in active_view.values_mut() {
-                if peer.info.id != info.id {
-                    if let Err(cause) = peer.send(&fwd).await {
-                        log::warn!("couldn't send forward join to {}: {}", info.id, cause);
-                        failed_peers.push(peer.info.id.clone());
-                    }
-                }
-            }
-        }
-
-        for pid in failed_peers {
-            if let Some(mut peer) = self.active_view_mut().remove(&pid) {
-                if let Err(cause) = self.disconnect(&mut peer, true).await {
-                    log::warn!("couldn't disconnect peer {}: {}", peer.info.id, cause);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn on_disconnected(&mut self, peer: PeerId, graceful: bool) -> Result<()> {
-        if let Some(mut peer) = self.active_view_mut().remove(&peer) {
-            let _ = peer.close().await; // it doesn't matter if we confirm close, as it may be already disconnected
-            if graceful {
-                // if shutdown was graceful, we demote peer into passive view for future use
-                let info = peer.info.id.clone();
-                self.passive_view_mut()
-                    .insert_replace(info, peer.into(), &mut thread_rng());
-            }
-
-            loop {
-                // promote passive peer into active one
-                if let Some((pid, promoted)) = self.passive_view_mut().remove_at(random()) {
-                    match self.connect(promoted.into()).await {
-                        Ok(peer) => {
-                            let high_priority = self.active_view().is_empty();
-                            self.add_active(peer, high_priority);
-                            break;
-                        }
-                        Err(cause) => {
-                            log::warn!("couldn't connect to {pid}: {cause}");
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn on_neighbor(&mut self, peer: Arc<PeerInfo>, high_priority: bool) -> Result<()> {
-        if high_priority || !self.active_view_mut().is_full() {
-            let peer = self.connect(peer).await?;
-            self.add_active(peer, high_priority).await?;
-        }
-        Ok(())
-    }
-
-    async fn on_forward_join(
-        &mut self,
-        peer: Arc<PeerInfo>,
-        sender: PeerId,
-        ttl: u32,
-    ) -> Result<()> {
-        if ttl == 0 || self.active_view().is_empty() {
-            let peer = self.connect(peer.clone()).await?;
-            self.add_active(peer, true).await?;
-        } else {
-            let myself = self.myself();
-            if ttl == self.membership_options().passive_random_walk_len {
-                if !self.already_known(&peer.id) {
-                    let peer = peer.clone();
-                    self.passive_view_mut().insert_replace(
-                        peer.id.clone(),
-                        peer.into(),
-                        &mut thread_rng(),
-                    );
-                }
-            }
-            if let Some(conn) = self
-                .active_view_mut()
-                .peek_value_mut(random(), |v| v.info.id != sender)
-            {
-                let msg = Message::forward_join(peer.into(), myself, ttl - 1);
-                conn.send(&msg).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn shuffle(&mut self) -> Result<()> {
-        let recipient = self.active_view_mut().peek_key(random()).cloned();
-        if let Some(recipient) = recipient {
-            let o = self.membership_options();
-            let alen = (o.shuffle_active_view_size as usize).min(self.active_view().len() - 1);
-            let plen = (o.shuffle_passive_view_size as usize).min(self.passive_view().len() - 1);
-            let mut nodes = Vec::with_capacity(alen + plen);
-            {
-                let mut peers: Vec<_> = self
-                    .active_view()
-                    .iter()
-                    .map(|(_, v)| v.info.clone())
-                    .collect();
-                if let Some(i) = peers.iter().position(|peer| peer.id == recipient) {
-                    peers.remove(i);
-                }
-                thread_rng().shuffle(&mut peers);
-                for pid in &peers[0..alen] {
-                    nodes.push(pid.clone());
-                }
-            }
-            {
-                let mut peers: Vec<_> = self
-                    .passive_view()
-                    .iter()
-                    .map(|(_, v)| v.info.clone())
-                    .collect();
-                thread_rng().shuffle(&mut peers);
-                for pid in &peers[0..plen] {
-                    nodes.push(pid.clone());
-                }
-            }
-            let myself = self.myself();
-            let msg =
-                Message::shuffle_request(myself.clone(), myself, o.shuffle_random_walk_len, nodes);
-            if let Some(peer) = self.active_view_mut().get_mut(&recipient) {
-                peer.send(&msg).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn on_shuffle_request(
-        &mut self,
-        origin: PeerId,
-        sender: PeerId,
-        ttl: u32,
-        nodes: Vec<Arc<PeerInfo>>,
-    ) -> Result<()> {
-        if ttl == 0 {
-            let exchange_len = self.passive_view().len().min(nodes.len());
-            let mut exchange_nodes = Vec::with_capacity(exchange_len);
-            for node in nodes {
-                if !self.already_known(&node.id) {
-                    if let Some((_, peer)) = self.passive_view_mut().insert_replace(
-                        node.id.clone(),
-                        node.into(),
-                        &mut thread_rng(),
-                    ) {
-                        exchange_nodes.push(peer.info);
-                    }
-                }
-            }
-            if !exchange_nodes.is_empty() {
-                if let Some(origin) = self.active_view_mut().get_mut(&origin) {
-                    origin
-                        .send(&Message::shuffle_response(exchange_nodes))
-                        .await?;
-                }
-            }
-        } else {
-            let myself = self.myself();
-            let peer = self
-                .active_view_mut()
-                .peek_value_mut(random(), |v| v.info.id != origin && v.info.id != sender);
-            if let Some(peer) = peer {
-                let msg = Message::shuffle_request(origin, myself, ttl - 1, nodes);
-                peer.send(&msg).await?;
-            }
-        }
-        Ok(())
-    }
-
-    fn on_shuffle_response(&mut self, nodes: &[Arc<PeerInfo>]) {
-        let mut rng = thread_rng();
-        for node in nodes {
-            if !self.already_known(&node.id) {
-                self.passive_view_mut().insert_replace(
-                    node.id.clone(),
-                    node.clone().into(),
-                    &mut rng,
-                );
-            }
-        }
-    }
-
-    fn already_known(&self, pid: &PeerId) -> bool {
-        self.myself_ref().eq(pid)
-            || self.active_view().contains(pid)
-            || self.passive_view().contains(pid)
-    }
-
-    async fn disconnect(&mut self, peer: &mut ActivePeer<S>, graceful: bool) -> Result<()> {
-        let myself = self.myself();
-        peer.send(&Message::disconnected(myself, graceful)).await?;
-        peer.close().await?;
-        Ok(())
-    }
+pub enum Message {
+    /* membership messages */
+    Join,
+    Neighbor(Arc<PeerInfo>, bool),
+    FwdJoin(Arc<PeerInfo>, TTL),
+    ShuffleReq(PeerId, TTL, Vec<Arc<PeerInfo>>),
+    ShuffleRep(Vec<Arc<PeerInfo>>),
+    /* gossiping messages */
 }
 
-#[derive(Debug, Clone)]
-pub enum PeerEvent {
-    Up(Arc<PeerInfo>),
-    Down(Arc<PeerInfo>),
-}
+#[cfg(test)]
+mod test {
+    use crate::peer::{Options, Peer, PeerInfo};
+    use crate::tcp::Tcp;
+    use crate::Result;
+    use std::sync::Arc;
 
-#[derive(Debug, Clone)]
-pub struct ActivePeer<S> {
-    pub(crate) info: Arc<PeerInfo>,
-    pub(crate) connection: Arc<Mutex<S>>,
-}
-
-impl<S> ActivePeer<S>
-where
-    S: Sink<Bytes, Error = Error> + Unpin,
-{
-    pub async fn send(&mut self, msg: &Message) -> Result<()> {
-        let mut buf = Vec::new();
-        msg.encode(&mut buf);
-        let mut sink = self.connection.lock().await;
-        sink.send(buf.into()).await?;
-        Ok(())
-    }
-
-    pub async fn close(&mut self) -> Result<()> {
-        let mut sink = self.connection.lock().await;
-        sink.close().await?;
-        Ok(())
+    async fn peer(endpoint: &str) -> Result<Peer<Tcp>> {
+        let options = Options {
+            myself: Arc::new(PeerInfo::new(endpoint.into())),
+        };
+        let tcp = Tcp::bind(endpoint, options.myself.clone()).await?;
+        Ok(Peer::new(tcp, options))
     }
 }
-
-impl<S> Into<PassivePeer> for ActivePeer<S> {
-    fn into(self) -> PassivePeer {
-        PassivePeer { info: self.info }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PassivePeer {
-    pub info: Arc<PeerInfo>,
-}
-
-#[derive(Debug, Eq, PartialEq, Hash)]
-pub struct PeerInfo {
-    pub pid: PeerId,
-    pub manifest: Manifest,
-}
-
-impl PeerInfo {
-    pub fn new(pid: PeerId, manifest: Manifest) -> Self {
-        PeerInfo { pid, manifest }
-    }
-
-    pub fn write<W: Write>(&self, w: &mut W) {
-        w.write_string(self.id.as_ref());
-        w.write_buf(&self.manifest);
-    }
-
-    pub fn read<R: Read>(r: &mut R) -> Result<Self, lib0::error::Error> {
-        let pid = Arc::from(r.read_string()?);
-        let manifest = Manifest::from(r.read_buf()?);
-        Ok(PeerInfo { pid, manifest })
-    }
-}
-
-impl Into<Arc<PeerInfo>> for PassivePeer {
-    fn into(self) -> Arc<PeerInfo> {
-        self.info
-    }
-}
-
-impl From<Arc<PeerInfo>> for PassivePeer {
-    fn from(value: Arc<PeerInfo>) -> Self {
-        PassivePeer { info: value }
-    }
-}
-
-pub type Manifest = Vec<u8>;
-*/

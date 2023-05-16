@@ -3,7 +3,7 @@ use rand::{Rng, RngCore};
 
 #[repr(transparent)]
 #[derive(Debug, Clone)]
-pub struct View<V>(Vec<(PeerId, V)>);
+pub(crate) struct View<V>(Vec<(PeerId, V)>);
 
 impl<V> View<V> {
     pub fn new(capacity: usize) -> Self {
@@ -63,10 +63,11 @@ impl<V> View<V> {
         Some(removed)
     }
 
-    pub fn remove_at(&mut self, at: usize) -> Option<(PeerId, V)> {
+    pub fn remove_at<R: RngCore>(&mut self, rng: &mut R) -> Option<(PeerId, V)> {
         if self.0.is_empty() {
             None
         } else {
+            let at: usize = rng.gen();
             let removed = self.0.remove(at % self.len());
             Some(removed)
         }
@@ -99,10 +100,11 @@ impl<V> View<V> {
         Keys(self.0.iter())
     }
 
-    pub fn peek_key(&self, at: usize) -> Option<&PeerId> {
+    pub fn peek_key<R: RngCore>(&self, rng: &mut R) -> Option<&PeerId> {
         if self.len() == 0 {
             None
         } else {
+            let at: usize = rng.gen();
             let mut i = at % self.len();
             let mut iter = self.keys();
             let mut last = None;
@@ -198,5 +200,35 @@ impl<'a, V> Iterator for ValuesMut<'a, V> {
 impl<'a, V> ExactSizeIterator for ValuesMut<'a, V> {
     fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::view::View;
+    use rand::thread_rng;
+
+    #[test]
+    fn capacity_management() {
+        let mut v = View::new(3);
+        assert!(v.is_empty());
+        let old = v.insert_replace("A".into(), "A1", &mut thread_rng());
+        assert!(old.is_none());
+        assert!(!v.is_empty());
+        let old = v.insert_replace("B".into(), "B1", &mut thread_rng());
+        assert!(old.is_none());
+        let old = v.insert_replace("C".into(), "C1", &mut thread_rng());
+        assert!(old.is_none());
+        assert!(v.is_full());
+        let old = v.insert_replace("D".into(), "D1", &mut thread_rng());
+        assert!(old.is_some());
+        assert!(!v.is_empty());
+        assert!(v.is_full());
+        assert_eq!(v.len(), 3);
+        v.remove(&"A".into());
+        v.remove(&"B".into());
+        v.remove(&"C".into());
+        v.remove(&"D".into());
+        assert!(v.is_empty());
     }
 }
