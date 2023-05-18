@@ -29,7 +29,7 @@ impl Tcp {
     pub async fn bind(addr: &str, info: Arc<PeerInfo>) -> Result<Self> {
         let server = TcpListener::bind(addr).await?;
         let public_endpoint = server.local_addr()?.to_string();
-        let peer_info = Bytes::from(serde_cbor::to_vec(&info)?);
+        let peer_info = Bytes::from(serde_json::to_vec(&info)?);
         Ok(Tcp {
             server,
             peer_info,
@@ -50,7 +50,7 @@ impl Tcp {
         let peer_info = self.peer_info.clone();
         sink.send(peer_info).await?;
         if let Some(res) = source.next().await {
-            let remote_peer_info = serde_cbor::from_slice::<PeerInfo>(&res?)?;
+            let remote_peer_info = serde_json::from_slice::<PeerInfo>(&res?)?;
             Ok(Arc::new(remote_peer_info))
         } else {
             Err(format!("remote peer receiver '{}' closed unexpectedly", addr).into())
@@ -80,7 +80,7 @@ impl Connector for Tcp {
         let peer_info = self
             .init_connection(&mut sink, &mut source, &addr.to_string())
             .await?;
-        log::info!(
+        log::trace!(
             "'{}' accepted connection from '{}' (peer id: {})",
             self.public_endpoint(),
             addr.to_string(),
@@ -97,7 +97,7 @@ impl Connector for Tcp {
         let peer_info = self
             .init_connection(&mut sink, &mut source, &remote_endpoint)
             .await?;
-        log::info!(
+        log::trace!(
             "'{}' connected to '{}' (peer id: {})",
             self.public_endpoint(),
             remote_endpoint,

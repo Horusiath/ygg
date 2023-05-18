@@ -1,8 +1,9 @@
 use crate::peer::PeerId;
 use rand::{Rng, RngCore};
+use std::fmt::Formatter;
 
 #[repr(transparent)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct View<V>(Vec<(PeerId, V)>);
 
 impl<V> View<V> {
@@ -92,8 +93,8 @@ impl<V> View<V> {
         Iter(self.0.iter())
     }
 
-    pub fn values_mut(&mut self) -> ValuesMut<V> {
-        ValuesMut(self.0.iter_mut())
+    pub fn values(&self) -> Values<V> {
+        Values(self.0.iter())
     }
 
     pub fn keys(&self) -> Keys<V> {
@@ -120,7 +121,7 @@ impl<V> View<V> {
         }
     }
 
-    pub fn peek_value_mut<F>(&mut self, at: usize, filter: F) -> Option<&mut V>
+    pub fn peek_value<F>(&self, at: usize, filter: F) -> Option<&V>
     where
         F: Fn(&V) -> bool,
     {
@@ -128,7 +129,7 @@ impl<V> View<V> {
             None
         } else {
             let mut i = at % self.len();
-            let mut iter = self.values_mut();
+            let mut iter = self.values();
             let mut last = None;
             while i != 0 {
                 i -= 1;
@@ -143,6 +144,22 @@ impl<V> View<V> {
             }
             last
         }
+    }
+}
+
+impl<V> AsRef<[(PeerId, V)]> for View<V> {
+    fn as_ref(&self) -> &[(PeerId, V)] {
+        &self.0
+    }
+}
+
+impl<V> std::fmt::Debug for View<V> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_list();
+        for (pid, _) in self.0.iter() {
+            s.entry(pid);
+        }
+        s.finish()
     }
 }
 
@@ -186,10 +203,10 @@ impl<'a, V> ExactSizeIterator for Iter<'a, V> {
 
 #[repr(transparent)]
 #[derive(Debug)]
-pub struct ValuesMut<'a, V>(std::slice::IterMut<'a, (PeerId, V)>);
+pub struct Values<'a, V>(std::slice::Iter<'a, (PeerId, V)>);
 
-impl<'a, V> Iterator for ValuesMut<'a, V> {
-    type Item = &'a mut V;
+impl<'a, V> Iterator for Values<'a, V> {
+    type Item = &'a V;
 
     fn next(&mut self) -> Option<Self::Item> {
         let (_, value) = self.0.next()?;
@@ -197,7 +214,7 @@ impl<'a, V> Iterator for ValuesMut<'a, V> {
     }
 }
 
-impl<'a, V> ExactSizeIterator for ValuesMut<'a, V> {
+impl<'a, V> ExactSizeIterator for Values<'a, V> {
     fn len(&self) -> usize {
         self.0.len()
     }

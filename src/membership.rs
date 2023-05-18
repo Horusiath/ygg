@@ -1,10 +1,10 @@
-use crate::peer::{Connector, Event, EventData, Peer, PeerId, PeerInfo};
+use crate::peer::{Connector, Event, EventData, Message, Peer, PeerId, PeerInfo};
 use crate::utils::RngExt;
 use crate::view::View;
-use crate::Result;
+use crate::{Result, TTL};
 use rand::{random, thread_rng, RngCore, SeedableRng};
-use rand_chacha::{ChaCha20Rng, ChaCha8Rng};
-use serde::{Deserialize, Serialize};
+use rand_chacha::ChaCha20Rng;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -84,11 +84,12 @@ where
             tokio::spawn(async move {
                 while let Ok(e) = events.recv().await {
                     if let Some(state) = state.upgrade() {
+                        log::trace!("'{}' received event: {}", peer.id(), e);
                         let mut state = state.lock().await;
                         let mut ctx = MessageExecutionContext::new(&mut state, &peer, &options);
                         if let Err(cause) = ctx.handle(e, &mut rng).await {
-                            let id = &peer.options().myself.id;
-                            log::error!("'{}' failed to handle incoming event: {}", id, cause);
+                            let id = peer.id();
+                            log::warn!("'{}' failed to handle incoming event: {}", id, cause);
                             break;
                         }
                     }
@@ -106,7 +107,7 @@ where
                         let mut state = state.lock().await;
                         let mut ctx = MessageExecutionContext::new(&mut state, &peer, &options);
                         if let Err(cause) = ctx.shuffle(&mut rng).await {
-                            let id = &peer.options().myself.id;
+                            let id = peer.id();
                             log::error!("'{}' failed to send shuffle request: {}", id, cause);
                             break;
                         }
@@ -125,14 +126,63 @@ where
         m
     }
 
+    pub async fn join<A>(&self, peer_id: A) -> Result<()>
+    where
+        A: Into<PeerId>,
+    {
+        let mut awaiter = self.peer.events();
+        let contact = peer_id.into();
+        self.peer.send(&contact, &Message::Join).await?;
+
+        // await for reply from contact peer
+        loop {
+            while let Ok(e) = awaiter.recv().await {
+                if let EventData::Message(data) = e.event {
+                    let response: Message = serde_json::from_slice(&data)?;
+                    match response {
+                        Message::Neighbor(info, true) if info.id == contact => {
+                            return Ok(());
+                        }
+                        _ => { /*do nothing */ }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn myself(&self) -> &PeerInfo {
         &self.peer.options().myself
     }
+
+    pub fn peer(&self) -> &Peer<C> {
+        &self.peer
+    }
+
+    pub async fn state_snapshot(&self) -> MembershipSnapshot {
+        let state = self.state.lock().await;
+        MembershipSnapshot::new(&state)
+    }
 }
 
+#[derive(Debug, Clone)]
 struct MembershipState {
     active_view: View<Arc<PeerInfo>>,
     passive_view: View<Arc<PeerInfo>>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MembershipSnapshot {
+    pub active_view: HashSet<Arc<PeerInfo>>,
+    pub passive_view: HashSet<Arc<PeerInfo>>,
+}
+
+impl MembershipSnapshot {
+    fn new(state: &MembershipState) -> Self {
+        MembershipSnapshot {
+            active_view: state.active_view.iter().map(|(_, i)| i.clone()).collect(),
+            passive_view: state.passive_view.iter().map(|(_, i)| i.clone()).collect(),
+        }
+    }
 }
 
 struct MessageExecutionContext<'a, C>
@@ -156,14 +206,18 @@ where
         }
     }
 
+    fn id(&self) -> &PeerId {
+        &self.peer.options().myself.id
+    }
+
     fn myself(&self) -> &PeerInfo {
         &self.peer.options().myself
     }
 
     pub async fn handle<R: RngCore>(&mut self, e: Event, rng: &mut R) -> Result<()> {
         match e.event {
-            EventData::Message(bytes) => {
-                let msg: Message = serde_cbor::from_slice(&bytes)?;
+            EventData::Message(data) => {
+                let msg = serde_json::from_slice(&data)?;
                 match msg {
                     Message::Join => self.on_join(e.sender, rng).await,
                     Message::FwdJoin(peer, ttl) => {
@@ -181,7 +235,10 @@ where
                     Message::ShuffleRep(peers) => Ok(self.on_shuffle_response(&peers, rng)),
                 }
             }
-            EventData::Up => Ok(()),
+            EventData::Up(false) => Ok(()),
+            EventData::Up(true) => {
+                Ok(()) // todo: what now?
+            }
             EventData::Down(alive) => self.on_disconnected(e.sender, alive, rng).await,
         }
     }
@@ -192,13 +249,14 @@ where
         high_priority: bool,
         rng: &mut R,
     ) -> Result<bool> {
-        if info.id == self.myself().id || self.state.active_view.contains(&info.id) {
+        if &info.id == self.id() || self.state.active_view.contains(&info.id) {
             return Ok(false);
         }
 
-        let msg = Message::Neighbor(info.clone(), high_priority);
+        let msg = Message::Neighbor(self.peer.options().myself.clone(), high_priority);
         self.peer.send(&info.id, &msg).await?;
 
+        log::trace!("'{}' adding '{}' as active peer", self.id(), &info.id);
         self.state.passive_view.remove(&info.id);
         let removed = self
             .state
@@ -215,15 +273,15 @@ where
     async fn on_join<R: RngCore>(&mut self, info: Arc<PeerInfo>, rng: &mut R) -> Result<()> {
         self.add_active(info.clone(), true, rng).await?;
         let ttl = self.options.active_random_walk_len;
-        let fwd = Message::FwdJoin(info.clone(), ttl);
 
         let mut fails = Vec::new();
         {
-            for info in self.state.active_view.values_mut() {
-                if info.id != info.id {
+            for ap in self.state.active_view.values() {
+                if ap.id != info.id {
+                    let fwd = Message::FwdJoin(ap.clone(), ttl);
                     if let Err(cause) = self.peer.send(&info.id, &fwd).await {
-                        log::warn!("couldn't send forward join to {}: {}", info.id, cause);
-                        fails.push(info.id.clone());
+                        log::warn!("couldn't send forward join to {}: {}", ap.id, cause);
+                        fails.push(ap.id.clone());
                     }
                 }
             }
@@ -281,6 +339,9 @@ where
     ) -> Result<()> {
         if high_priority || !self.state.active_view.is_full() {
             self.add_active(peer, high_priority, rng).await?;
+        } else {
+            // active peer set is full
+            self.peer.disconnect(&peer.id).await?;
         }
         Ok(())
     }
@@ -294,6 +355,7 @@ where
     ) -> Result<()> {
         if ttl == 0 || self.state.active_view.is_empty() {
             self.add_active(peer, true, rng).await?;
+            Ok(())
         } else {
             if ttl == self.options.passive_random_walk_len {
                 if !self.already_known(&peer.id) {
@@ -303,16 +365,22 @@ where
                         .insert_replace(peer.id.clone(), peer.into(), rng);
                 }
             }
-            if let Some(info) = self
+            let id = self.id().clone();
+            let next = self
                 .state
                 .active_view
-                .peek_value_mut(random(), |v| v.id != sender)
-            {
-                let msg = Message::FwdJoin(peer, ttl - 1);
-                self.peer.send(&info.id, &msg).await?;
+                .peek_value(random(), |v| v.id != sender && v.id != peer.id);
+            match next {
+                None => {
+                    self.add_active(peer, true, rng).await?;
+                    Ok(())
+                }
+                Some(info) => {
+                    let msg = Message::FwdJoin(peer, ttl - 1);
+                    self.peer.send(&info.id, &msg).await
+                }
             }
         }
-        Ok(())
     }
 
     async fn shuffle<R: RngCore>(&mut self, rng: &mut R) -> Result<()> {
@@ -350,7 +418,7 @@ where
                     nodes.push(pid.clone());
                 }
             }
-            let myself = self.myself().id.clone();
+            let myself = self.id().clone();
             let msg = Message::ShuffleReq(myself, self.options.shuffle_random_walk_len, nodes);
             if let Some(info) = self.state.active_view.get_mut(&recipient) {
                 self.peer.send(&info.id, &msg).await?;
@@ -392,7 +460,7 @@ where
             let peer = self
                 .state
                 .active_view
-                .peek_value_mut(random(), |v| v.id != origin && v.id != sender);
+                .peek_value(random(), |v| v.id != origin && v.id != sender);
             if let Some(info) = peer {
                 let msg = Message::ShuffleReq(origin, ttl - 1, nodes);
                 self.peer.send(&info.id, &msg).await?;
@@ -412,30 +480,21 @@ where
     }
 
     fn already_known(&self, pid: &PeerId) -> bool {
-        &self.myself().id == pid
+        self.id() == pid
             || self.state.active_view.contains(pid)
             || self.state.passive_view.contains(pid)
     }
 }
 
-pub type TTL = u32;
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Message {
-    /* membership messages */
-    Join,
-    Neighbor(Arc<PeerInfo>, bool),
-    FwdJoin(Arc<PeerInfo>, TTL),
-    ShuffleReq(PeerId, TTL, Vec<Arc<PeerInfo>>),
-    ShuffleRep(Vec<Arc<PeerInfo>>),
-    /* gossiping messages */
-}
-
 #[cfg(test)]
 mod test {
-    use crate::peer::{Options, Peer, PeerInfo};
+    use crate::membership::Membership;
+    use crate::peer::{Connector, EventData, Options, Peer, PeerId, PeerInfo};
     use crate::tcp::Tcp;
     use crate::Result;
+    use log::LevelFilter;
+    use rand::prelude::ThreadRng;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     async fn peer(endpoint: &str) -> Result<Peer<Tcp>> {
@@ -444,5 +503,74 @@ mod test {
         };
         let tcp = Tcp::bind(endpoint, options.myself.clone()).await?;
         Ok(Peer::new(tcp, options))
+    }
+
+    #[tokio::test]
+    async fn active_view_is_symetric() -> Result<()> {
+        let _ = env_logger::builder()
+            .filter_level(LevelFilter::Info)
+            .is_test(true)
+            .try_init();
+
+        const PEER_COUNT: usize = 3;
+        let mut members = Vec::with_capacity(PEER_COUNT);
+        let mut events = Vec::with_capacity(PEER_COUNT);
+        for i in 0..PEER_COUNT {
+            let peer = peer(&format!("127.0.0.1:{}", 13000 + i)).await?;
+            events.push(peer.events());
+            let m = Membership::new::<ThreadRng>(Arc::new(peer));
+            members.push(m);
+        }
+        for i in 1..PEER_COUNT {
+            let m = &members[i];
+            m.join("127.0.0.1:13000").await?;
+        }
+        for i in 0..PEER_COUNT {
+            let mut remaining = PEER_COUNT - 1;
+            let events = &mut events[i];
+            while remaining > 0 {
+                let e = events.recv().await?;
+                if let EventData::Message(e) = e.event {
+                    remaining -= 1;
+                }
+            }
+        }
+
+        assert_symmetric_peers(&members).await;
+
+        Ok(())
+    }
+
+    /// Assert that for every active peer of X->{Y0..Yn}, X also exists in an active set of {Y0..Yn}.
+    async fn assert_symmetric_peers<'a, I, C>(members: I)
+    where
+        I: IntoIterator<Item = &'a Membership<C>>,
+        C: Connector + 'static,
+    {
+        let mut views = HashMap::new();
+        for m in members {
+            let id = m.peer().id().clone();
+            let state = m.state_snapshot().await;
+            assert!(!state.active_view.is_empty(), "{} has not active peers", id);
+            let active = state
+                .active_view
+                .into_iter()
+                .map(|i| i.id.clone())
+                .collect::<HashSet<PeerId>>();
+            views.insert(id, active);
+        }
+        for (x, active_view) in views.iter() {
+            for y in active_view.iter() {
+                let peers = &views[y];
+                assert!(
+                    peers.contains(x),
+                    "missing symmetric connection between:\n\t\"{}\" -> {:?}\nand\n\t\"{}\" -> {:?}",
+                    x,
+                    active_view,
+                    y,
+                    peers
+                );
+            }
+        }
     }
 }

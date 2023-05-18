@@ -17,7 +17,7 @@ log = "0.4"
 async-trait = "0.1"
 bytes = "1.4.0"
 futures-util = {version = "0.3.28", features = ["sink"] }
-serde_cbor = "0.11"
+serde_json = "1.0"
 wrtc = "^0.2"
 
 [dev-dependencies]

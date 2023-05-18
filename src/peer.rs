@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::{Error, Result, TTL};
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use rand::distributions::Alphanumeric;
@@ -64,11 +64,13 @@ where
 
                                             let _ = mailbox
                                                 .send(Event::down(graceful, peer_info.clone()));
-                                            let _ = mailbox.send(Event::up(peer_info.clone()));
+                                            let _ =
+                                                mailbox.send(Event::up(peer_info.clone(), false));
                                         }
                                         Entry::Vacant(e) => {
                                             e.insert(peer.clone());
-                                            let _ = mailbox.send(Event::up(peer_info.clone()));
+                                            let _ =
+                                                mailbox.send(Event::up(peer_info.clone(), false));
                                         }
                                     }
                                 }
@@ -103,6 +105,13 @@ where
         &self.options
     }
 
+    pub fn myself(&self) -> &PeerInfo {
+        &self.options.myself
+    }
+    pub fn id(&self) -> &PeerId {
+        &self.options.myself.id
+    }
+
     pub fn events(&self) -> Receiver<Event> {
         self.events.subscribe()
     }
@@ -115,10 +124,11 @@ where
             let result = {
                 let connections = self.connections.read().await;
                 if let Some(conn) = connections.get(recipient) {
-                    let data = Bytes::from(serde_cbor::to_vec(msg)?);
+                    let data = Bytes::from(serde_json::to_vec(msg)?);
                     conn.send(data).await.map(|_| None)
                 } else {
-                    log::info!("establishing new connection to '{recipient}'");
+                    let id = self.id();
+                    log::trace!("'{id}' establishing new connection to '{recipient}'");
                     let (peer_info, sink, source) = self.connector.connect(recipient).await?;
                     let peer = ActivePeer::new(peer_info, sink);
                     Ok(Some((peer, source)))
@@ -126,7 +136,8 @@ where
             };
             match result {
                 Ok(None) => {
-                    log::info!("successfully sent message to '{recipient}': {msg:?}");
+                    let id = self.id();
+                    log::trace!("'{id}' successfully sent message to '{recipient}': {msg:?}");
                     return Ok(());
                 }
                 Ok(Some((peer, source))) => {
@@ -152,7 +163,7 @@ where
                             }
                         }
                     }
-                    let _ = self.events.send(Event::up(peer_info.clone()));
+                    let _ = self.events.send(Event::up(peer_info.clone(), true));
                     let receiver_loop = tokio::spawn(Self::handle_conn(
                         source,
                         peer_info,
@@ -203,10 +214,10 @@ where
         connections: Weak<RwLock<HashMap<Arc<str>, Arc<ActivePeer<C::Sink>>>>>,
     ) {
         let mut graceful = true;
-        while let Some(msg) = source.next().await {
-            match msg {
-                Ok(msg) => {
-                    let _ = mailbox.send(Event::message(msg, peer_info.clone()));
+        while let Some(data) = source.next().await {
+            match data {
+                Ok(data) => {
+                    let _ = mailbox.send(Event::message(data, peer_info.clone()));
                 }
                 Err(e) => {
                     graceful = false;
@@ -304,10 +315,10 @@ pub struct Event {
 }
 
 impl Event {
-    pub(crate) fn up(sender: Arc<PeerInfo>) -> Self {
+    pub(crate) fn up(sender: Arc<PeerInfo>, initiator: bool) -> Self {
         Event {
             sender,
-            event: EventData::Up,
+            event: EventData::Up(initiator),
         }
     }
     pub(crate) fn down(graceful: bool, sender: Arc<PeerInfo>) -> Self {
@@ -324,11 +335,42 @@ impl Event {
     }
 }
 
+impl std::fmt::Display for Event {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.event {
+            EventData::Message(msg) => write!(f, "MSG({}, {:?})", self.sender.id, msg),
+            EventData::Up(initiator) => write!(
+                f,
+                "UP({}, {})",
+                self.sender.id,
+                if *initiator { "initiator" } else { "acceptor" }
+            ),
+            EventData::Down(alive) => write!(
+                f,
+                "DOWN({}, {})",
+                self.sender.id,
+                if *alive { "alive" } else { "dead" }
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum EventData {
     Message(Bytes),
-    Up,
+    Up(bool),
     Down(bool),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Message {
+    /* membership messages */
+    Join,
+    Neighbor(Arc<PeerInfo>, bool),
+    FwdJoin(Arc<PeerInfo>, TTL),
+    ShuffleReq(PeerId, TTL, Vec<Arc<PeerInfo>>),
+    ShuffleRep(Vec<Arc<PeerInfo>>),
+    /* gossiping messages */
 }
 
 #[async_trait::async_trait]
@@ -372,12 +414,12 @@ mod test {
         p1.send(&b.id, &"hello").await?;
         p2.send(&a.id, &"world").await?;
 
-        let expected_msg = Bytes::from(serde_cbor::to_vec(&"world")?);
-        assert_eq!(e1.recv().await, Ok(Event::up(b.clone())));
+        let expected_msg = Bytes::from(serde_json::to_vec(&"world")?);
+        assert_eq!(e1.recv().await, Ok(Event::up(b.clone(), true)));
         assert_eq!(e1.recv().await, Ok(Event::message(expected_msg, b.clone())));
 
-        let expected_msg = Bytes::from(serde_cbor::to_vec(&"hello")?);
-        assert_eq!(e2.recv().await, Ok(Event::up(a.clone())));
+        let expected_msg = Bytes::from(serde_json::to_vec(&"hello")?);
+        assert_eq!(e2.recv().await, Ok(Event::up(a.clone(), false)));
         assert_eq!(e2.recv().await, Ok(Event::message(expected_msg, a)));
 
         drop(e2);
@@ -404,12 +446,12 @@ mod test {
         p1.send(&b.id, &"hello").await?;
         p2.send(&a.id, &"world").await?;
 
-        let expected_msg = Bytes::from(serde_cbor::to_vec(&"world")?);
-        assert_eq!(e1.recv().await, Ok(Event::up(b.clone())));
+        let expected_msg = Bytes::from(serde_json::to_vec(&"world")?);
+        assert_eq!(e1.recv().await, Ok(Event::up(b.clone(), true)));
         assert_eq!(e1.recv().await, Ok(Event::message(expected_msg, b.clone())));
 
-        let expected_msg = Bytes::from(serde_cbor::to_vec(&"hello")?);
-        assert_eq!(e2.recv().await, Ok(Event::up(a.clone())));
+        let expected_msg = Bytes::from(serde_json::to_vec(&"hello")?);
+        assert_eq!(e2.recv().await, Ok(Event::up(a.clone(), false)));
         assert_eq!(e2.recv().await, Ok(Event::message(expected_msg, a.clone())));
 
         p1.disconnect(&b.id).await?;
