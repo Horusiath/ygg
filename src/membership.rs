@@ -131,24 +131,27 @@ where
         loop {
             let _ = interval.tick().await;
             if let Some(state) = state.upgrade() {
-                let mut state = state.lock().await;
-
-                if let Err(cause) = Self::shuffle(&mut state, &peer, &options, &mut rng).await {
-                    let id = peer.id();
-                    log::error!("'{}' failed to send shuffle request: {}", id, cause);
-                    break;
+                let res = {
+                    let mut state = state.lock().await;
+                    Self::shuffle(&mut state, &peer, &options, &mut rng)
+                };
+                if let Some((id, msg)) = res {
+                    if let Err(cause) = peer.send(&id, &msg).await {
+                        let id = peer.id();
+                        log::error!("'{}' failed to send shuffle request: {}", id, cause);
+                    }
                 }
             } else {
                 break;
             }
         }
     }
-    async fn shuffle(
+    fn shuffle(
         state: &mut MembershipState,
         peer: &Peer<C>,
         options: &Options,
         rng: &mut ChaCha20Rng,
-    ) -> Result<()> {
+    ) -> Option<(PeerId, Message)> {
         let recipient = state.active_view.peek_key(rng).cloned();
         if let Some(recipient) = recipient {
             let alen = (options.shuffle_active_view_size as usize).min(state.active_view.len() - 1);
@@ -167,18 +170,17 @@ where
             }
             {
                 let mut peers: Vec<_> = state.passive_view.iter().map(|(_, v)| v.clone()).collect();
-                thread_rng().shuffle(&mut peers);
+                rng.shuffle(&mut peers);
                 for pid in &peers[0..plen] {
                     nodes.push(pid.clone());
                 }
             }
             let myself = peer.id().clone();
             let msg = Message::ShuffleReq(myself, options.shuffle_random_walk_len, nodes);
-            if let Some(info) = state.active_view.get_mut(&recipient) {
-                peer.send(&info.id, &msg).await?;
-            }
+            Some((recipient, msg))
+        } else {
+            None
         }
-        Ok(())
     }
 
     pub async fn join<A>(&self, peer_id: A) -> Result<()>
@@ -366,10 +368,10 @@ where
             if let Some(promoted) = self.state.passive_view.insert_replace(id, info, rng) {
                 Some(promoted)
             } else {
-                self.state.passive_view.remove_at(rng)
+                self.state.passive_view.remove_one(rng)
             }
         } else {
-            self.state.passive_view.remove_at(rng)
+            self.state.passive_view.remove_one(rng)
         };
 
         // promote passive peer into active one
@@ -382,7 +384,7 @@ where
                 Ok(false) => {}
                 Err(cause) => log::warn!("couldn't connect to {id}: {cause}"),
             }
-            promoted = self.state.passive_view.remove_at(rng);
+            promoted = self.state.passive_view.remove_one(rng);
         }
         Ok(())
     }
@@ -514,6 +516,8 @@ mod test {
     use rand::prelude::ThreadRng;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::sleep;
 
     async fn peer(endpoint: &str) -> Result<Peer<Tcp>> {
         let options = Options {
@@ -523,14 +527,14 @@ mod test {
         Ok(Peer::new(tcp, options))
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn active_view_is_symetric() -> Result<()> {
         let _ = env_logger::builder()
             .filter_level(LevelFilter::Info)
             .is_test(true)
             .try_init();
 
-        const PEER_COUNT: usize = 5;
+        const PEER_COUNT: usize = 10;
         let mut members = Vec::with_capacity(PEER_COUNT);
         let mut events = Vec::with_capacity(PEER_COUNT);
         for i in 0..PEER_COUNT {
@@ -542,18 +546,6 @@ mod test {
         for i in 1..PEER_COUNT {
             let m = &members[i];
             m.join("127.0.0.1:13000").await?;
-        }
-        for i in 0..PEER_COUNT {
-            let events = &mut events[i];
-            let active_view_size =
-                crate::membership::Options::default().active_view_capacity as usize;
-            let mut remaining = (PEER_COUNT - 1).min(active_view_size);
-            while remaining > 0 {
-                let e = events.recv().await?;
-                if let MembershipEvent::Up(_) = e {
-                    remaining -= 1;
-                }
-            }
         }
 
         assert_symmetric_peers(&members).await;

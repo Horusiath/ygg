@@ -64,7 +64,7 @@ impl<V> View<V> {
         Some(removed)
     }
 
-    pub fn remove_at<R: RngCore>(&mut self, rng: &mut R) -> Option<(PeerId, V)> {
+    pub fn remove_one<R: RngCore>(&mut self, rng: &mut R) -> Option<(PeerId, V)> {
         if self.0.is_empty() {
             None
         } else {
