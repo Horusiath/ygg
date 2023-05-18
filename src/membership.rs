@@ -5,7 +5,7 @@ use crate::{Result, TTL};
 use rand::{random, thread_rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -51,42 +51,52 @@ where
     state: Arc<Mutex<MembershipState>>,
     msg_handler: JoinHandle<()>,
     shuffle: JoinHandle<()>,
+    membership_events: tokio::sync::broadcast::Sender<MembershipEvent>,
 }
 
 impl<C> Membership<C>
 where
     C: Connector + 'static,
 {
-    pub fn new<R>(peer: Arc<Peer<C>>) -> Self
+    pub fn new<R>(peer: Peer<C>) -> Self
     where
         R: RngCore + Default,
     {
         Self::with_options::<R>(peer, Options::default())
     }
 
-    pub fn with_options<R>(peer: Arc<Peer<C>>, options: Options) -> Self
+    pub fn with_options<R>(mut peer: Peer<C>, options: Options) -> Self
     where
         R: RngCore + Default,
     {
+        let mut events = peer.claim().unwrap();
+        let peer = Arc::new(peer);
         let active_view = View::new(options.active_view_capacity as usize);
         let passive_view = View::new(options.passive_view_capacity as usize);
         let state = Arc::new(Mutex::new(MembershipState {
             active_view,
             passive_view,
         }));
+        let (membership_events, _) =
+            tokio::sync::broadcast::channel(options.active_view_capacity as usize);
         let mut rng = ChaCha20Rng::from_rng(&mut R::default()).unwrap();
         let msg_handler = {
-            let mut events = peer.events();
             let mut rng = rng.clone();
             let state = Arc::downgrade(&state);
             let options = options.clone();
             let peer = peer.clone();
+            let membership_events = membership_events.clone();
             tokio::spawn(async move {
-                while let Ok(e) = events.recv().await {
+                while let Some(e) = events.recv().await {
                     if let Some(state) = state.upgrade() {
                         log::trace!("'{}' received event: {}", peer.id(), e);
                         let mut state = state.lock().await;
-                        let mut ctx = MessageExecutionContext::new(&mut state, &peer, &options);
+                        let mut ctx = MessageExecutionContext::new(
+                            &mut state,
+                            &peer,
+                            &options,
+                            &membership_events,
+                        );
                         if let Err(cause) = ctx.handle(e, &mut rng).await {
                             let id = peer.id();
                             log::warn!("'{}' failed to handle incoming event: {}", id, cause);
@@ -99,55 +109,84 @@ where
         let shuffle = {
             let state = Arc::downgrade(&state);
             let peer = peer.clone();
-            tokio::spawn(async move {
-                let mut interval = interval(options.shuffle_interval);
-                loop {
-                    let _ = interval.tick().await;
-                    if let Some(state) = state.upgrade() {
-                        let mut state = state.lock().await;
-                        let mut ctx = MessageExecutionContext::new(&mut state, &peer, &options);
-                        if let Err(cause) = ctx.shuffle(&mut rng).await {
-                            let id = peer.id();
-                            log::error!("'{}' failed to send shuffle request: {}", id, cause);
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            })
+            tokio::spawn(Self::shuffle_task(state, peer, options, rng))
         };
         let m = Membership {
             peer,
             state,
             msg_handler,
             shuffle,
+            membership_events,
         };
         m
+    }
+
+    async fn shuffle_task(
+        state: Weak<Mutex<MembershipState>>,
+        peer: Arc<Peer<C>>,
+        options: Options,
+        mut rng: ChaCha20Rng,
+    ) {
+        let mut interval = interval(options.shuffle_interval);
+        loop {
+            let _ = interval.tick().await;
+            if let Some(state) = state.upgrade() {
+                let mut state = state.lock().await;
+
+                if let Err(cause) = Self::shuffle(&mut state, &peer, &options, &mut rng).await {
+                    let id = peer.id();
+                    log::error!("'{}' failed to send shuffle request: {}", id, cause);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    async fn shuffle(
+        state: &mut MembershipState,
+        peer: &Peer<C>,
+        options: &Options,
+        rng: &mut ChaCha20Rng,
+    ) -> Result<()> {
+        let recipient = state.active_view.peek_key(rng).cloned();
+        if let Some(recipient) = recipient {
+            let alen = (options.shuffle_active_view_size as usize).min(state.active_view.len() - 1);
+            let plen =
+                (options.shuffle_passive_view_size as usize).min(state.passive_view.len() - 1);
+            let mut nodes = Vec::with_capacity(alen + plen);
+            {
+                let mut peers: Vec<_> = state.active_view.iter().map(|(_, v)| v.clone()).collect();
+                if let Some(i) = peers.iter().position(|peer| peer.id == recipient) {
+                    peers.remove(i);
+                }
+                rng.shuffle(&mut peers);
+                for pid in &peers[0..alen] {
+                    nodes.push(pid.clone());
+                }
+            }
+            {
+                let mut peers: Vec<_> = state.passive_view.iter().map(|(_, v)| v.clone()).collect();
+                thread_rng().shuffle(&mut peers);
+                for pid in &peers[0..plen] {
+                    nodes.push(pid.clone());
+                }
+            }
+            let myself = peer.id().clone();
+            let msg = Message::ShuffleReq(myself, options.shuffle_random_walk_len, nodes);
+            if let Some(info) = state.active_view.get_mut(&recipient) {
+                peer.send(&info.id, &msg).await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn join<A>(&self, peer_id: A) -> Result<()>
     where
         A: Into<PeerId>,
     {
-        let mut awaiter = self.peer.events();
         let contact = peer_id.into();
-        self.peer.send(&contact, &Message::Join).await?;
-
-        // await for reply from contact peer
-        loop {
-            while let Ok(e) = awaiter.recv().await {
-                if let EventData::Message(data) = e.event {
-                    let response: Message = serde_json::from_slice(&data)?;
-                    match response {
-                        Message::Neighbor(info, true) if info.id == contact => {
-                            return Ok(());
-                        }
-                        _ => { /*do nothing */ }
-                    }
-                }
-            }
-        }
+        self.peer.send(&contact, &Message::Join).await
     }
 
     pub fn myself(&self) -> &PeerInfo {
@@ -156,6 +195,10 @@ where
 
     pub fn peer(&self) -> &Peer<C> {
         &self.peer
+    }
+
+    pub fn membership_events(&self) -> tokio::sync::broadcast::Receiver<MembershipEvent> {
+        self.membership_events.subscribe()
     }
 
     pub async fn state_snapshot(&self) -> MembershipSnapshot {
@@ -192,17 +235,24 @@ where
     state: &'a mut MembershipState,
     peer: &'a Arc<Peer<C>>,
     options: &'a Options,
+    membership_events: &'a tokio::sync::broadcast::Sender<MembershipEvent>,
 }
 
 impl<'a, C> MessageExecutionContext<'a, C>
 where
     C: Connector + 'static,
 {
-    fn new(state: &'a mut MembershipState, peer: &'a Arc<Peer<C>>, options: &'a Options) -> Self {
+    fn new(
+        state: &'a mut MembershipState,
+        peer: &'a Arc<Peer<C>>,
+        options: &'a Options,
+        membership_events: &'a tokio::sync::broadcast::Sender<MembershipEvent>,
+    ) -> Self {
         MessageExecutionContext {
             state,
             peer,
             options,
+            membership_events,
         }
     }
 
@@ -235,11 +285,11 @@ where
                     Message::ShuffleRep(peers) => Ok(self.on_shuffle_response(&peers, rng)),
                 }
             }
-            EventData::Up(false) => Ok(()),
-            EventData::Up(true) => {
+            EventData::Connected(false) => Ok(()),
+            EventData::Connected(true) => {
                 Ok(()) // todo: what now?
             }
-            EventData::Down(alive) => self.on_disconnected(e.sender, alive, rng).await,
+            EventData::Disconnected(alive) => self.on_disconnected(e.sender, alive, rng).await,
         }
     }
 
@@ -258,11 +308,16 @@ where
 
         log::trace!("'{}' adding '{}' as active peer", self.id(), &info.id);
         self.state.passive_view.remove(&info.id);
+        let pid = info.id.clone();
         let removed = self
             .state
             .active_view
-            .insert_replace(info.id.clone(), info, rng);
+            .insert_replace(pid.clone(), info, rng);
+        let _ = self.membership_events.send(MembershipEvent::Up(pid));
         if let Some((pid, peer)) = removed {
+            let _ = self
+                .membership_events
+                .send(MembershipEvent::Down(pid.clone()));
             if let Err(cause) = self.peer.disconnect(&pid).await {
                 log::warn!("couldn't close peer {pid}: {cause}");
             }
@@ -289,6 +344,7 @@ where
 
         for pid in fails {
             if let Some(info) = self.state.active_view.remove(&pid) {
+                let _ = self.membership_events.send(MembershipEvent::Down(pid));
                 if let Err(cause) = self.peer.disconnect(&info.id).await {
                     log::warn!("couldn't disconnect peer {}: {}", info.id, cause);
                 }
@@ -383,50 +439,6 @@ where
         }
     }
 
-    async fn shuffle<R: RngCore>(&mut self, rng: &mut R) -> Result<()> {
-        let recipient = self.state.active_view.peek_key(rng).cloned();
-        if let Some(recipient) = recipient {
-            let alen = (self.options.shuffle_active_view_size as usize)
-                .min(self.state.active_view.len() - 1);
-            let plen = (self.options.shuffle_passive_view_size as usize)
-                .min(self.state.passive_view.len() - 1);
-            let mut nodes = Vec::with_capacity(alen + plen);
-            {
-                let mut peers: Vec<_> = self
-                    .state
-                    .active_view
-                    .iter()
-                    .map(|(_, v)| v.clone())
-                    .collect();
-                if let Some(i) = peers.iter().position(|peer| peer.id == recipient) {
-                    peers.remove(i);
-                }
-                thread_rng().shuffle(&mut peers);
-                for pid in &peers[0..alen] {
-                    nodes.push(pid.clone());
-                }
-            }
-            {
-                let mut peers: Vec<_> = self
-                    .state
-                    .passive_view
-                    .iter()
-                    .map(|(_, v)| v.clone())
-                    .collect();
-                thread_rng().shuffle(&mut peers);
-                for pid in &peers[0..plen] {
-                    nodes.push(pid.clone());
-                }
-            }
-            let myself = self.id().clone();
-            let msg = Message::ShuffleReq(myself, self.options.shuffle_random_walk_len, nodes);
-            if let Some(info) = self.state.active_view.get_mut(&recipient) {
-                self.peer.send(&info.id, &msg).await?;
-            }
-        }
-        Ok(())
-    }
-
     async fn on_shuffle_request<R: RngCore>(
         &mut self,
         origin: PeerId,
@@ -486,9 +498,15 @@ where
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MembershipEvent {
+    Up(PeerId),
+    Down(PeerId),
+}
+
 #[cfg(test)]
 mod test {
-    use crate::membership::Membership;
+    use crate::membership::{Membership, MembershipEvent};
     use crate::peer::{Connector, EventData, Options, Peer, PeerId, PeerInfo};
     use crate::tcp::Tcp;
     use crate::Result;
@@ -512,13 +530,13 @@ mod test {
             .is_test(true)
             .try_init();
 
-        const PEER_COUNT: usize = 3;
+        const PEER_COUNT: usize = 5;
         let mut members = Vec::with_capacity(PEER_COUNT);
         let mut events = Vec::with_capacity(PEER_COUNT);
         for i in 0..PEER_COUNT {
             let peer = peer(&format!("127.0.0.1:{}", 13000 + i)).await?;
-            events.push(peer.events());
-            let m = Membership::new::<ThreadRng>(Arc::new(peer));
+            let m = Membership::new::<ThreadRng>(peer);
+            events.push(m.membership_events());
             members.push(m);
         }
         for i in 1..PEER_COUNT {
@@ -526,11 +544,13 @@ mod test {
             m.join("127.0.0.1:13000").await?;
         }
         for i in 0..PEER_COUNT {
-            let mut remaining = PEER_COUNT - 1;
             let events = &mut events[i];
+            let active_view_size =
+                crate::membership::Options::default().active_view_capacity as usize;
+            let mut remaining = (PEER_COUNT - 1).min(active_view_size);
             while remaining > 0 {
                 let e = events.recv().await?;
-                if let EventData::Message(e) = e.event {
+                if let MembershipEvent::Up(_) = e {
                     remaining -= 1;
                 }
             }

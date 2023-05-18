@@ -8,7 +8,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::sync::{Arc, Weak};
-use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
 
 pub type PeerId = Arc<str>;
@@ -22,6 +22,7 @@ where
     connections: Arc<RwLock<HashMap<PeerId, Arc<ActivePeer<C::Sink>>>>>,
     options: Options,
     events: Sender<Event>,
+    events_reader: Option<Receiver<Event>>,
 }
 
 impl<C> Peer<C>
@@ -31,7 +32,7 @@ where
     pub fn new(connector: C, options: Options) -> Self {
         let connector = Arc::new(connector);
         let connections = Arc::new(RwLock::new(HashMap::new()));
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
 
         let acceptor_job = {
             let server = connector.clone();
@@ -63,14 +64,17 @@ where
                                             };
 
                                             let _ = mailbox
-                                                .send(Event::down(graceful, peer_info.clone()));
-                                            let _ =
-                                                mailbox.send(Event::up(peer_info.clone(), false));
+                                                .send(Event::down(graceful, peer_info.clone()))
+                                                .await;
+                                            let _ = mailbox
+                                                .send(Event::up(peer_info.clone(), false))
+                                                .await;
                                         }
                                         Entry::Vacant(e) => {
                                             e.insert(peer.clone());
-                                            let _ =
-                                                mailbox.send(Event::up(peer_info.clone(), false));
+                                            let _ = mailbox
+                                                .send(Event::up(peer_info.clone(), false))
+                                                .await;
                                         }
                                     }
                                 }
@@ -98,6 +102,7 @@ where
             options,
             connections,
             events: tx,
+            events_reader: Some(rx),
         }
     }
 
@@ -112,8 +117,11 @@ where
         &self.options.myself.id
     }
 
-    pub fn events(&self) -> Receiver<Event> {
-        self.events.subscribe()
+    /// Claim the control over the receiver channel, enabled to read incoming events.
+    /// Only one owner can claim the control over receiver channel. Subsequent requests will
+    /// return `None`.
+    pub fn claim(&mut self) -> Option<Receiver<Event>> {
+        self.events_reader.take()
     }
 
     pub(crate) async fn send<M>(&self, recipient: &PeerId, msg: &M) -> Result<()>
@@ -156,14 +164,15 @@ where
                                 };
                                 let _ = self
                                     .events
-                                    .send(Event::down(graceful, old.peer_info.clone()));
+                                    .send(Event::down(graceful, old.peer_info.clone()))
+                                    .await;
                             }
                             Entry::Vacant(e) => {
                                 e.insert(peer.clone());
                             }
                         }
                     }
-                    let _ = self.events.send(Event::up(peer_info.clone(), true));
+                    let _ = self.events.send(Event::up(peer_info.clone(), true)).await;
                     let receiver_loop = tokio::spawn(Self::handle_conn(
                         source,
                         peer_info,
@@ -202,7 +211,7 @@ where
                 log::info!("disconnected from '{peer}'");
                 true
             };
-            let _ = self.events.send(Event::down(graceful, peer_info));
+            let _ = self.events.send(Event::down(graceful, peer_info)).await;
         }
         Ok(())
     }
@@ -217,7 +226,7 @@ where
         while let Some(data) = source.next().await {
             match data {
                 Ok(data) => {
-                    let _ = mailbox.send(Event::message(data, peer_info.clone()));
+                    let _ = mailbox.send(Event::msg(data, peer_info.clone())).await;
                 }
                 Err(e) => {
                     graceful = false;
@@ -236,7 +245,7 @@ where
                 }
             }
         }
-        let _ = mailbox.send(Event::down(graceful, peer_info));
+        let _ = mailbox.send(Event::down(graceful, peer_info)).await;
     }
 }
 
@@ -318,16 +327,16 @@ impl Event {
     pub(crate) fn up(sender: Arc<PeerInfo>, initiator: bool) -> Self {
         Event {
             sender,
-            event: EventData::Up(initiator),
+            event: EventData::Connected(initiator),
         }
     }
     pub(crate) fn down(graceful: bool, sender: Arc<PeerInfo>) -> Self {
         Event {
             sender,
-            event: EventData::Down(graceful),
+            event: EventData::Disconnected(graceful),
         }
     }
-    pub(crate) fn message(msg: Bytes, sender: Arc<PeerInfo>) -> Self {
+    pub(crate) fn msg(msg: Bytes, sender: Arc<PeerInfo>) -> Self {
         Event {
             sender,
             event: EventData::Message(msg),
@@ -339,13 +348,13 @@ impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.event {
             EventData::Message(msg) => write!(f, "MSG({}, {:?})", self.sender.id, msg),
-            EventData::Up(initiator) => write!(
+            EventData::Connected(initiator) => write!(
                 f,
                 "UP({}, {})",
                 self.sender.id,
                 if *initiator { "initiator" } else { "acceptor" }
             ),
-            EventData::Down(alive) => write!(
+            EventData::Disconnected(alive) => write!(
                 f,
                 "DOWN({}, {})",
                 self.sender.id,
@@ -358,8 +367,8 @@ impl std::fmt::Display for Event {
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum EventData {
     Message(Bytes),
-    Up(bool),
-    Down(bool),
+    Connected(bool),
+    Disconnected(bool),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -404,10 +413,10 @@ mod test {
 
     #[tokio::test]
     async fn peer_connection_lifecycle() -> Result<()> {
-        let p1 = peer("localhost:12001").await?;
-        let mut e1 = p1.events();
-        let p2 = peer("localhost:12002").await?;
-        let mut e2 = p2.events();
+        let mut p1 = peer("localhost:12001").await?;
+        let mut e1 = p1.claim().unwrap();
+        let mut p2 = peer("localhost:12002").await?;
+        let mut e2 = p2.claim().unwrap();
 
         let a = Arc::new(PeerInfo::new("localhost:12001".into()));
         let b = Arc::new(PeerInfo::new("localhost:12002".into()));
@@ -415,17 +424,17 @@ mod test {
         p2.send(&a.id, &"world").await?;
 
         let expected_msg = Bytes::from(serde_json::to_vec(&"world")?);
-        assert_eq!(e1.recv().await, Ok(Event::up(b.clone(), true)));
-        assert_eq!(e1.recv().await, Ok(Event::message(expected_msg, b.clone())));
+        assert_eq!(e1.recv().await, Some(Event::up(b.clone(), true)));
+        assert_eq!(e1.recv().await, Some(Event::msg(expected_msg, b.clone())));
 
         let expected_msg = Bytes::from(serde_json::to_vec(&"hello")?);
-        assert_eq!(e2.recv().await, Ok(Event::up(a.clone(), false)));
-        assert_eq!(e2.recv().await, Ok(Event::message(expected_msg, a)));
+        assert_eq!(e2.recv().await, Some(Event::up(a.clone(), false)));
+        assert_eq!(e2.recv().await, Some(Event::msg(expected_msg, a)));
 
         drop(e2);
         drop(p2);
 
-        assert_eq!(e1.recv().await, Ok(Event::down(true, b)));
+        assert_eq!(e1.recv().await, Some(Event::down(true, b)));
 
         Ok(())
     }
@@ -436,10 +445,10 @@ mod test {
             .filter_level(LevelFilter::Info)
             .is_test(true)
             .try_init();
-        let p1 = peer("127.0.0.1:12003").await?;
-        let mut e1 = p1.events();
-        let p2 = peer("127.0.0.1:12004").await?;
-        let mut e2 = p2.events();
+        let mut p1 = peer("127.0.0.1:12003").await?;
+        let mut e1 = p1.claim().unwrap();
+        let mut p2 = peer("127.0.0.1:12004").await?;
+        let mut e2 = p2.claim().unwrap();
 
         let a = Arc::new(PeerInfo::new("127.0.0.1:12003".into()));
         let b = Arc::new(PeerInfo::new("127.0.0.1:12004".into()));
@@ -447,16 +456,16 @@ mod test {
         p2.send(&a.id, &"world").await?;
 
         let expected_msg = Bytes::from(serde_json::to_vec(&"world")?);
-        assert_eq!(e1.recv().await, Ok(Event::up(b.clone(), true)));
-        assert_eq!(e1.recv().await, Ok(Event::message(expected_msg, b.clone())));
+        assert_eq!(e1.recv().await, Some(Event::up(b.clone(), true)));
+        assert_eq!(e1.recv().await, Some(Event::msg(expected_msg, b.clone())));
 
         let expected_msg = Bytes::from(serde_json::to_vec(&"hello")?);
-        assert_eq!(e2.recv().await, Ok(Event::up(a.clone(), false)));
-        assert_eq!(e2.recv().await, Ok(Event::message(expected_msg, a.clone())));
+        assert_eq!(e2.recv().await, Some(Event::up(a.clone(), false)));
+        assert_eq!(e2.recv().await, Some(Event::msg(expected_msg, a.clone())));
 
         p1.disconnect(&b.id).await?;
-        assert_eq!(e1.recv().await, Ok(Event::down(true, b.clone())));
-        assert_eq!(e2.recv().await, Ok(Event::down(true, a.clone())));
+        assert_eq!(e1.recv().await, Some(Event::down(true, b.clone())));
+        assert_eq!(e2.recv().await, Some(Event::down(true, a.clone())));
 
         Ok(())
     }
