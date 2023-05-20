@@ -19,8 +19,6 @@ bytes = "1.4.0"
 futures-util = {version = "0.3.28", features = ["sink"] }
 serde_json = "1.0"
 wrtc = "^0.2"
-im = "15.1"
-arc-swap = "1.6"
 
 [dev-dependencies]
 turmoil = "0.5"

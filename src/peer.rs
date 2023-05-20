@@ -8,7 +8,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::sync::{Arc, Weak};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, RwLock};
 
 pub type PeerId = Arc<str>;
@@ -21,8 +21,8 @@ where
     connector: Arc<C>,
     connections: Arc<RwLock<HashMap<PeerId, Arc<ActivePeer<C::Sink>>>>>,
     options: Options,
-    events: Sender<Event>,
-    events_reader: Option<Receiver<Event>>,
+    events: UnboundedSender<Event>,
+    events_reader: Option<UnboundedReceiver<Event>>,
 }
 
 impl<C> Peer<C>
@@ -32,7 +32,7 @@ where
     pub fn new(connector: C, options: Options) -> Self {
         let connector = Arc::new(connector);
         let connections = Arc::new(RwLock::new(HashMap::new()));
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         let acceptor_job = {
             let server = connector.clone();
@@ -49,7 +49,7 @@ where
                                     let mut connections = connections.write().await;
                                     match connections.entry(peer_id.clone()) {
                                         Entry::Occupied(mut e) => {
-                                            log::info!(
+                                            log::trace!(
                                                 "replacing existing peer connection '{peer_id}'"
                                             );
                                             let old = e.insert(peer.clone());
@@ -64,17 +64,14 @@ where
                                             };
 
                                             let _ = mailbox
-                                                .send(Event::down(graceful, peer_info.clone()))
-                                                .await;
-                                            let _ = mailbox
-                                                .send(Event::up(peer_info.clone(), false))
-                                                .await;
+                                                .send(Event::down(graceful, peer_info.clone()));
+                                            let _ =
+                                                mailbox.send(Event::up(peer_info.clone(), false));
                                         }
                                         Entry::Vacant(e) => {
                                             e.insert(peer.clone());
-                                            let _ = mailbox
-                                                .send(Event::up(peer_info.clone(), false))
-                                                .await;
+                                            let _ =
+                                                mailbox.send(Event::up(peer_info.clone(), false));
                                         }
                                     }
                                 }
@@ -120,7 +117,7 @@ where
     /// Claim the control over the receiver channel, enabled to read incoming events.
     /// Only one owner can claim the control over receiver channel. Subsequent requests will
     /// return `None`.
-    pub fn claim(&mut self) -> Option<Receiver<Event>> {
+    pub fn claim(&mut self) -> Option<UnboundedReceiver<Event>> {
         self.events_reader.take()
     }
 
@@ -154,7 +151,7 @@ where
                         let mut connections = self.connections.write().await;
                         match connections.entry(recipient.clone()) {
                             Entry::Occupied(mut e) => {
-                                log::info!("replacing existing peer connection '{recipient}'");
+                                log::trace!("replacing existing peer connection '{recipient}'");
                                 let old = e.insert(peer.clone());
                                 let graceful = if let Err(e) = old.close().await {
                                     log::warn!("failed to gracefully close '{recipient}': {e}");
@@ -164,15 +161,14 @@ where
                                 };
                                 let _ = self
                                     .events
-                                    .send(Event::down(graceful, old.peer_info.clone()))
-                                    .await;
+                                    .send(Event::down(graceful, old.peer_info.clone()));
                             }
                             Entry::Vacant(e) => {
                                 e.insert(peer.clone());
                             }
                         }
                     }
-                    let _ = self.events.send(Event::up(peer_info.clone(), true)).await;
+                    let _ = self.events.send(Event::up(peer_info.clone(), true));
                     let receiver_loop = tokio::spawn(Self::handle_conn(
                         source,
                         peer_info,
@@ -208,10 +204,10 @@ where
                 log::warn!("failed to gracefully close connection to '{peer}': {e}");
                 false
             } else {
-                log::info!("disconnected from '{peer}'");
+                log::trace!("disconnected from '{peer}'");
                 true
             };
-            let _ = self.events.send(Event::down(graceful, peer_info)).await;
+            let _ = self.events.send(Event::down(graceful, peer_info));
         }
         Ok(())
     }
@@ -219,14 +215,14 @@ where
     async fn handle_conn(
         mut source: C::Source,
         peer_info: Arc<PeerInfo>,
-        mailbox: Sender<Event>,
+        mailbox: UnboundedSender<Event>,
         connections: Weak<RwLock<HashMap<Arc<str>, Arc<ActivePeer<C::Sink>>>>>,
     ) {
         let mut graceful = true;
         while let Some(data) = source.next().await {
             match data {
                 Ok(data) => {
-                    let _ = mailbox.send(Event::msg(data, peer_info.clone())).await;
+                    let _ = mailbox.send(Event::msg(data, peer_info.clone()));
                 }
                 Err(e) => {
                     graceful = false;
@@ -245,7 +241,7 @@ where
                 }
             }
         }
-        let _ = mailbox.send(Event::down(graceful, peer_info)).await;
+        let _ = mailbox.send(Event::down(graceful, peer_info));
     }
 }
 

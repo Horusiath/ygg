@@ -121,20 +121,21 @@ impl<V> View<V> {
         }
     }
 
-    pub fn peek_value<F>(&self, at: usize, filter: F) -> Option<&V>
-    where
-        F: Fn(&V) -> bool,
-    {
+    pub fn peek_value<const N: usize, R: RngCore>(
+        &self,
+        rng: &mut R,
+        except: [&PeerId; N],
+    ) -> Option<&V> {
         if self.len() == 0 {
             None
         } else {
-            let mut i = at % self.len();
-            let mut iter = self.values();
+            let mut i = rng.gen_range(0..self.len());
+            let mut iter = self.iter();
             let mut last = None;
             while i != 0 {
                 i -= 1;
-                if let Some(v) = iter.next() {
-                    if !filter(v) {
+                if let Some((id, v)) = iter.next() {
+                    if except.contains(&id) {
                         continue; // skip over
                     }
                     last = Some(v);
